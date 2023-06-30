@@ -29,6 +29,7 @@ def main():
 
     parser = transformers.HfArgumentParser((DataArguments, TrainingArguments))
     data_args, training_args = parser.parse_args_into_dataclasses()
+    # print(training_args.mode)
 
     accelerator = accelerate_patch.MyAccelerator(
         gradient_accumulation_steps=training_args.gradient_accumulation_steps,
@@ -60,7 +61,10 @@ def main():
         **model_module,
         tokenizer=tokenizer,
     )
-    trainer.train()
+    if training_args.mode == 'train':
+        trainer.train()
+    elif training_args.mode == 'eval':
+        trainer.evaluate(step_idx=0)
 
 
 if __name__ == "__main__":

@@ -40,6 +40,8 @@ class DataArguments:
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
+    mode: str = field(default='train')
+    use_value_in_decoding: bool = field(default=False)
     wandb_project: str = field(default=constants.WANDB_PROJECT)
     cache_dir: Optional[str] = field(default=constants.DEFAULT_CACHE_DIR)
     flash_attn: bool = field(default=False)
@@ -87,9 +89,9 @@ class TrainingArguments(transformers.TrainingArguments):
     k_beta: float = field(default=0.1)
     adaptive_kl: bool = field(default=False)
     eval_batches: int = field(default=sys.maxsize, metadata={"help": "Maximum number of batches to evaluate on."})
-    init_value_with_reward: bool = field(
-        default=True, metadata={"help": "Initialize the value model with the reward model."}
-    )
+    # init_value_with_reward: bool = field(
+    #     default=True, metadata={"help": "Initialize the value model with the reward model."}
+    # )
     save_steps_extra: Optional[str] = field(
         default=None,
         metadata={
@@ -100,6 +102,7 @@ class TrainingArguments(transformers.TrainingArguments):
     query_len: int = field(default=192)
     response_len: int = field(default=300)
     policy_model_name_or_path: str = field(default=None)
+    value_model_name_or_path: str = field(default=None)
     reward_model_name_or_path: str = field(default=None)
     use_fast_tokenizer: bool = field(
         default=False,

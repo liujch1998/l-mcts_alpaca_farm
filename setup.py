@@ -37,7 +37,7 @@ setuptools.setup(
         "nltk",
         "accelerate>=0.18.0",
         "tabulate",
-        "transformers>=4.26.0",
+        "transformers==4.30.2",
         "statsmodels",
         "tiktoken>=0.3.2",
         "markdown",
@@ -45,7 +45,7 @@ setuptools.setup(
         "sentencepiece",
         "pandas",
         "wandb",
-        "torch>=1.13.1",
+        "torch==1.13.1",
         "fire",
         "openai",
         "alpaca_eval",
@@ -53,8 +53,8 @@ setuptools.setup(
     extras_require={
         "full": [
             # Training efficiency.
-            "flash-attn",
-            "apex",
+            "flash-attn==1.0.7",
+            # "apex",
             "deepspeed",
             # Plotting and visualization.
             "benepar",

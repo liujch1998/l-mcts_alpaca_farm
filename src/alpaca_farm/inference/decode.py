@@ -112,6 +112,35 @@ class HFDecodingArguments:
     max_new_tokens: int = 100  # This is aligned with `openai_utils.OpenAIDecodingArguments`.
     num_return_sequences: int = 1
 
+class MyLogitsProcessor(transformers.LogitsProcessor):
+    def __init__(self, value_model):
+        self.value_model = value_model
+        from collections import defaultdict
+        self.records = defaultdict(list)
+
+    def __call__(self, input_ids, scores):
+        '''
+        input_ids: (B, L)
+        scores: (B, V)
+        '''
+        k = 5
+        topk_indices = torch.topk(scores, k=k, dim=-1).indices # (B, K)
+        flattened_topk_indices = topk_indices.view(-1, 1) # (B * K, 1)
+        extended_input_ids = input_ids.repeat_interleave(k, dim=0) # (B * K, L)
+        extended_input_ids = torch.cat([extended_input_ids, flattened_topk_indices], dim=-1) # (B * K, L + 1)
+        values = self.value_model.forward2(extended_input_ids) # (B * K)
+        values = values.view(-1, k) # (B, K)
+        B = input_ids.size(0)
+        for b in range(B):
+            self.records[b].append({
+                'greedy_token_id': topk_indices[b, 0].item(),
+                'greedy_token': self.value_model.base_tokenizer.decode([topk_indices[b, 0].item()]),
+                'topk_token_ids': topk_indices[b].tolist(), # (K)
+                'topk_tokens': self.value_model.base_tokenizer.batch_decode([[_] for _ in topk_indices[b].tolist()]),
+                'topk_logits': scores[b, topk_indices[b]].tolist(),
+                'topk_values': values[b].tolist(),
+            })
+        return scores
 
 @torch.inference_mode()
 def decode_prompts_with_huggingface_given_model(
@@ -131,6 +160,7 @@ def decode_prompts_with_huggingface_given_model(
     seed: Optional[int] = None,
     communication_num_chunks=1,
     tokenization_batch_size=1000,
+    value_model: Optional[torch.nn.Module] = None,
     **decoding_kwargs,
 ) -> Union[List[List[str]], List[str]]:
     """Decode from a given model a sequence of string prompts."""
@@ -168,6 +198,7 @@ def decode_prompts_with_huggingface_given_model(
     # TODO(lxuechen): Refactor to tokenize upfront. This way we can pad with tokenizer, and not worry ourselves.
 
     completions = []
+    logits_processor = MyLogitsProcessor(value_model=value_model)
     for batch_idx, start_idx in tqdm.tqdm(
         enumerate(range(0, len(new_prompts), per_device_batch_size)),  # Increase the index by the actual batch size.
         desc="decoding batches",
@@ -182,6 +213,8 @@ def decode_prompts_with_huggingface_given_model(
 
         if batch_idx == 0:  # FSDP is buggy; we do a forward pass first to make it happy
             model(input_ids=inputs, attention_mask=attention_mask)
+            if value_model is not None:
+                value_model(queries=inputs, query_attn_masks=attention_mask, responses=inputs)
 
         if (
             internal_batch_return_sequences is not None
@@ -231,7 +264,11 @@ def decode_prompts_with_huggingface_given_model(
                     f"num_return_sequences ({decoding_args.num_return_sequences}). Not batching over return sequences."
                 )
 
-            sequences = model.generate(inputs=inputs, attention_mask=attention_mask, **generate_kwargs)
+            if value_model is not None:
+                # values = value_model(queries=inputs, query_attn_masks=attention_mask, responses=sequences).values # (B, Lr)
+                sequences = model.generate(inputs=inputs, attention_mask=attention_mask, logits_processor=[logits_processor], **generate_kwargs)
+            else:
+                sequences = model.generate(inputs=inputs, attention_mask=attention_mask, **generate_kwargs)
             if not model.config.is_encoder_decoder:
                 sequences = sequences[:, inputs.shape[1] :]
             sequences = torch_ops.right_pad(sequences, (sequences.size(0), pad_to_length), value=tokenizer.pad_token_id)
@@ -280,7 +317,12 @@ def decode_prompts_with_huggingface_given_model(
 
     text_sequences = text_sequences[:ori_data_size]
 
-    return text_sequences
+    records = [logits_processor.records[b] for b in range(len(logits_processor.records))]
+    records = records[:ori_data_size]
+    if len(records) < ori_data_size:
+        records += [None] * (ori_data_size - len(records))
+
+    return text_sequences, records
 
 
 def decode_prompts_with_huggingface(

@@ -190,6 +190,7 @@ class RLTrainer(object):
             total=total_steps,
         ):
             if step_idx % self.args.save_steps == 0 or step_idx in self.args.save_steps_extra_list:
+                # self.save_model(utils.join(self.args.output_dir, f"checkpoint-last"))
                 self.save_model(utils.join(self.args.output_dir, f"checkpoint-{step_idx}"))
             if self.args.eval_steps is not None and step_idx % self.args.eval_steps == 0:
                 self.evaluate(step_idx)
@@ -210,6 +211,8 @@ class RLTrainer(object):
         if any(item is None for item in (prompts, list_dict_data)):
             logger.warning("No evaluation data, skipping evaluation.", main_process_only=True)
             return
+        prompts = prompts[:self.args.per_device_eval_batch_size]
+        list_dict_data = list_dict_data[:self.args.per_device_eval_batch_size]
 
         # Constants.
         model_name = Path(self.args.output_dir).stem  # Don't use the helper in common, as no checkpoint is saved yet.
@@ -221,30 +224,40 @@ class RLTrainer(object):
         self.policy.eval()
         self._make_fsdp_happy()
         if unwrapped_policy is None:
-            unwrapped_policy = self.accelerator.unwrap_model(self.policy, keep_fp32_wrapper=True)
-            unwrapped_policy = unwrapped_policy.policy.base_model
+            unwrapped = self.accelerator.unwrap_model(self.policy, keep_fp32_wrapper=True)
+            unwrapped_policy = unwrapped.policy.base_model
+            # unwrapped_value = unwrapped.value_model
 
-        outputs = decode.decode_prompts_with_huggingface_given_model(
+        # import time
+        # logger.warning(f'Start decoding at time {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}')
+        outputs, records = decode.decode_prompts_with_huggingface_given_model(
             model=unwrapped_policy,
             tokenizer=self.tokenizer,
             prompts=prompts,
-            decoding_args=decode.HFDecodingArguments(max_new_tokens=self.args.response_len, temperature=temperature),
+            decoding_args=decode.HFDecodingArguments(max_new_tokens=self.args.response_len, temperature=temperature, do_sample=False),
             per_device_batch_size=self.args.per_device_eval_batch_size,
             divide_work=False,
+            # mixed_precision='bf16', # to suppress the mixed_precision fallback to fp32 warning # BUGGY, do not use
+            # value_model=unwrapped_value if self.args.use_value_in_decoding else None,
+            value_model=self.policy.value_model if self.args.use_value_in_decoding else None,
         )
+        # logger.warning(f'End decoding at time {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}')
         sequences = [i + o for i, o in utils.zip_(prompts, outputs)]
+        # logger.warning(f'Start scoring at time {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}')
         rewards = score.score_sequences_with_huggingface_given_model(
             model=self.reward_model,
             tokenizer=self.tokenizer,
             sequences=sequences,
             per_device_batch_size=self.args.rollout_per_device_batch_size,
             divide_work=False,
+            # mixed_precision='bf16',
         )
+        # logger.warning(f'End scoring at time {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}')
 
         if self.accelerator.is_main_process:
             results = [
-                {"reward": reward, model_name_at_step: output, **example}
-                for reward, output, example in utils.zip_(rewards, outputs, list_dict_data)
+                {"reward": reward, model_name_at_step: output, "record": record, **example}
+                for reward, output, record, example in utils.zip_(rewards, outputs, records, list_dict_data)
             ]
             if self.args.output_dir is not None:
                 utils.jdump(results, utils.join(self.args.output_dir, f"eval_results_{step_idx}.json"))

@@ -27,6 +27,7 @@ import transformers
 from torch import Tensor, nn
 
 from .. import common, logging, torch_ops
+from .value_model import ValueModel
 
 logger = logging.get_logger(__name__)
 
@@ -134,44 +135,63 @@ class AutoregressivePolicy(Policy):
         return dict(responses=responses)  # Size (bsz * num_return_sequences, response_len).
 
 
-class Value(nn.Module, abc.ABC):
-    def __init__(
-        self, args, base_model: transformers.PreTrainedModel, base_tokenizer: transformers.PreTrainedTokenizer
-    ):
-        super().__init__()
-        self.args = args
-        self.base_model = base_model
-        self.base_tokenizer = base_tokenizer
-        hidden_size = common.get_transformer_hidden_size(base_model)
-        value_head = torch.nn.Linear(hidden_size, 1)
-        value_head.weight.data.zero_()
-        value_head.bias.data.zero_()
-        self.value_head = value_head.to(next(base_model.parameters()).device)
+# class Value(nn.Module, abc.ABC):
+#     def __init__(
+#         self, args, base_model: transformers.PreTrainedModel, base_tokenizer: transformers.PreTrainedTokenizer, reward_head=None
+#     ):
+#         super().__init__()
+#         self.args = args
+#         self.base_model = base_model
+#         self.base_tokenizer = base_tokenizer
+#         if reward_head is not None:
+#             self.value_head = reward_head
+#         else:
+#             hidden_size = common.get_transformer_hidden_size(base_model)
+#             value_head = torch.nn.Linear(hidden_size, 1)
+#             value_head.weight.data.zero_()
+#             value_head.bias.data.zero_()
+#             self.value_head = value_head.to(next(base_model.parameters()).device)
 
-    @abc.abstractmethod
-    def forward(self, queries: Tensor, query_attn_masks: Tensor, responses: Tensor) -> Dict[str, Tensor]:
-        raise NotImplementedError
+#     @abc.abstractmethod
+#     def forward(self, queries: Tensor, query_attn_masks: Tensor, responses: Tensor) -> Dict[str, Tensor]:
+#         raise NotImplementedError
 
 
-class AutoregressiveValue(Value):
-    def forward(self, queries: Tensor, query_attn_masks: Tensor, responses: Tensor) -> Dict[str, Tensor]:
-        sequences = torch.cat([queries, responses], dim=1)
-        sequence_attn_masks = sequences.ne(self.base_tokenizer.pad_token_id)
+# class AutoregressiveValue(Value):
+#     def forward(self, queries: Tensor, query_attn_masks: Tensor, responses: Tensor) -> Dict[str, Tensor]:
+#         sequences = torch.cat([queries, responses], dim=1)
+#         sequence_attn_masks = sequences.ne(self.base_tokenizer.pad_token_id)
 
-        inputs = self.base_model.prepare_inputs_for_generation(
-            input_ids=sequences,
-            attention_mask=sequence_attn_masks,
-            use_cache=False,
-        )
-        outputs = self.base_model.model(**inputs, return_dict=True)
-        # value[t]: \hat{V}(sequences_{:t-1}); must align with `_estimate_advantage`.
-        last_hidden_state = outputs.last_hidden_state[:, queries.size(1) - 1 : -1]
-        values = self.value_head(last_hidden_state).squeeze(-1)
-        return dict(values=values)
+#         inputs = self.base_model.prepare_inputs_for_generation(
+#             input_ids=sequences,
+#             attention_mask=sequence_attn_masks,
+#             use_cache=False,
+#         )
+#         outputs = self.base_model.model(**inputs, return_dict=True) # (B, Lq+Lr, V)
+#         # value[t]: \hat{V}(sequences_{:t-1}); must align with `_estimate_advantage`.
+#         last_hidden_state = outputs.last_hidden_state[:, queries.size(1) - 1 : -1] # (B, Lr, V)
+#         values = self.value_head(last_hidden_state).squeeze(-1) # (B, Lr)
+#         return dict(values=values)
 
+#     def forward2(self, input_ids):
+#         '''
+#         input_ids: (B, Lq+Lr)
+#         return: values (B)
+#         '''
+#         attn_masks = input_ids.ne(self.base_tokenizer.pad_token_id)
+#         # inputs = self.base_model.prepare_inputs_for_generation(
+#         #     input_ids=input_ids,
+#         #     attention_mask=attn_masks,
+#         #     use_cache=False,
+#         # )
+#         outputs = self.base_model.model(input_ids=input_ids, attention_mask=attn_masks, return_dict=True) # (B, Lq+Lr, V)
+#         last_hidden_state = outputs.last_hidden_state[:, -1, :] # (B, V)
+#         values = self.value_head(last_hidden_state).squeeze(-1) # (B)
+#         # print(input_ids, last_hidden_state, values)
+#         return values
 
 class ActorCritic(nn.Module):
-    def __init__(self, policy: Policy, value_model: Value):
+    def __init__(self, policy: Policy, value_model: ValueModel):
         super(ActorCritic, self).__init__()
         self.policy = policy
         self.value_model = value_model
@@ -203,12 +223,22 @@ def make_policy_with_base_model(
         return AutoregressivePolicy(args, base_model, base_tokenizer)
 
 
-def make_value_with_base_model(
-    args,
-    base_model: transformers.PreTrainedModel,
-    base_tokenizer: transformers.PreTrainedTokenizer,
-) -> Value:
-    if base_model.config.is_encoder_decoder:
-        raise NotImplementedError
-    else:
-        return AutoregressiveValue(args, base_model, base_tokenizer)
+# def make_value_with_base_model(
+#     args,
+#     base_model: transformers.PreTrainedModel,
+#     base_tokenizer: transformers.PreTrainedTokenizer,
+# ) -> Value:
+#     if base_model.config.is_encoder_decoder:
+#         raise NotImplementedError
+#     else:
+#         return AutoregressiveValue(args, base_model, base_tokenizer)
+
+# def make_value_with_reward_model(
+#     args,
+#     reward_model: transformers.PreTrainedModel,
+#     reward_tokenizer: transformers.PreTrainedTokenizer,
+# ) -> Value:
+#     if reward_model.config.is_encoder_decoder:
+#         raise NotImplementedError
+#     else:
+#         return AutoregressiveValue(args, reward_model.backbone_model, reward_tokenizer, reward_model.reward_head)

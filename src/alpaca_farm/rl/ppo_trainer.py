@@ -28,6 +28,7 @@ from transformers.modeling_utils import unwrap_model
 
 from .. import accelerate_patch, common, constants, data_preprocessor, logging, torch_ops, utils
 from ..models import reward_model as reward_model_module
+from ..models import value_model as value_model_module
 from ..models import rl_models
 from ..types import AnyPath, AnyPathOrNone, LRScheduler, Tensor
 from . import rl_trainer
@@ -332,6 +333,51 @@ class PPOTrainer(rl_trainer.RLTrainer):
             logger.warning("Finished gathering full state_dict...")
 
         if self.accelerator.is_main_process:
+            # # Additionally save the value model ckpt
+            # value_state_dict = dict()
+            # prefix = "value_model.base_model."
+            # for key, value in state_dict.items():
+            #     if key.startswith(prefix):
+            #         value_state_dict[key[len(prefix) :]] = value
+            # if check_corrupted:  # Let the checks run on GPU.
+            #     is_corrupted = any(value.isnan().any().item() for value in value_state_dict.values())
+            #     logger.warning(f"Is there nans in the state_dict to be dumped? {is_corrupted}")
+            # cpu_value_state_dict = {key: value.cpu() for key, value in value_state_dict.items()}
+            # unwrapped = unwrap_model(model).value_model.base_model
+            # assert isinstance(
+            #     unwrapped, (transformers.OPTForCausalLM, transformers.LlamaForCausalLM)
+            # ), f"Expected to save a generative value model, but found model to be of type: {type(unwrapped)}."
+            # if hasattr(unwrapped, "_keys_to_ignore_on_save"):
+            #     logger.warning(f"keys to ignore on save: {unwrapped._keys_to_ignore_on_save}")
+            # logger.warning(f"Saving value model checkpoint to {output_dir}")
+            # logger.warning(f"Saving {len(cpu_value_state_dict)} keys:\n{utils.jdumps(cpu_value_state_dict.keys())}")
+            # utils.makedirs(os.path.join(output_dir, 'value'))
+            # unwrapped.save_pretrained(os.path.join(output_dir, 'value'), state_dict=cpu_value_state_dict)
+            # tokenizer.save_pretrained(os.path.join(output_dir, 'value'))
+
+            # Bug fix: value head was not saved in the previous version!
+            # Additionally save the value model ckpt
+            value_state_dict = dict()
+            prefix = "value_model."
+            for key, value in state_dict.items():
+                if key.startswith(prefix):
+                    value_state_dict[key[len(prefix) :]] = value
+            if check_corrupted:  # Let the checks run on GPU.
+                is_corrupted = any(value.isnan().any().item() for value in value_state_dict.values())
+                logger.warning(f"Is there nans in the state_dict to be dumped? {is_corrupted}")
+            cpu_value_state_dict = {key: value.cpu() for key, value in value_state_dict.items()}
+            unwrapped = unwrap_model(model).value_model
+            assert isinstance(
+                unwrapped.backbone_model, (transformers.OPTForCausalLM, transformers.LlamaForCausalLM)
+            ), f"Expected to save a generative value model, but found model to be of type: {type(unwrapped)}."
+            if hasattr(unwrapped.backbone_model, "_keys_to_ignore_on_save"):
+                logger.warning(f"keys to ignore on save: {unwrapped.backbone_model._keys_to_ignore_on_save}")
+            logger.warning(f"Saving value model checkpoint to {output_dir}")
+            logger.warning(f"Saving {len(cpu_value_state_dict)} keys:\n{utils.jdumps(cpu_value_state_dict.keys())}")
+            utils.makedirs(os.path.join(output_dir, 'value'))
+            unwrapped.save_pretrained(os.path.join(output_dir, 'value'), state_dict=cpu_value_state_dict)
+            tokenizer.save_pretrained(os.path.join(output_dir, 'value'))
+
             # Retain and remap policy keys.
             new_state_dict = dict()
             prefix = "policy.base_model."
@@ -411,10 +457,20 @@ def make_models(
             mixed_precision=accelerator.mixed_precision,
             cache_dir=args.cache_dir,
             low_cpu_mem_usage=True,
-            device_map={"": accelerator.device},
+            # device_map={"": accelerator.device},
         )
         utils.stable_resize_token_embeddings(base_model, len(tokenizer))
         return base_model
+
+    def make_value_model():
+        return value_model_module.ValueModel.from_pretrained(
+            args.value_model_name_or_path,
+            flash_attn=args.flash_attn,
+            mixed_precision=accelerator.mixed_precision,
+            cache_dir=args.cache_dir,
+            low_cpu_mem_usage=True,
+            # device_map={"": accelerator.device},
+        )
 
     def make_reward_model():
         return reward_model_module.RewardModel.from_pretrained(
@@ -423,7 +479,7 @@ def make_models(
             mixed_precision=accelerator.mixed_precision,
             cache_dir=args.cache_dir,
             low_cpu_mem_usage=True,
-            device_map={"": accelerator.device},
+            # device_map={"": accelerator.device},
         )
 
     # Model construction below seems convoluted, but it's made to trade time for RAM efficiency.
@@ -432,10 +488,17 @@ def make_models(
     # General strategy is to 1) create a model, 2) move it to target device / shard it, 3) then start next model,
     # as opposed to creating all needed models on CPU first, and separately moving / sharding each.
     policy = rl_models.make_policy_with_base_model(args, make_generative_policy(), tokenizer)
-    if args.init_value_with_reward:
-        # Initialize value from reward model a la OAI.
-        logger.warning("Initializing value model with reward model.")
-        value_model = rl_models.make_value_with_base_model(args, make_reward_model().backbone_model, tokenizer)
+    # import time
+    # time.sleep(1000000000)
+    if args.value_model_name_or_path is not None:
+        logger.warning("Initializing value model with pretrained model.")
+        value_model = make_value_model()
+        value_model.base_tokenizer = tokenizer
+    # if args.init_value_with_reward:
+    #     # Initialize value from reward model a la OAI.
+    #     logger.warning("Initializing value model with reward model.")
+    #     # value_model = rl_models.make_value_with_base_model(args, make_reward_model().backbone_model, tokenizer)
+    #     value_model = rl_models.make_value_with_reward_model(args, make_reward_model(), tokenizer)
     else:
         logger.warning("Initializing value model with policy model.")
         # Initialize value from policy. Works for sanity, but generally performs worse in instruction-following.
@@ -447,18 +510,24 @@ def make_models(
     actor_critic = common.prepare_model_for_custom_fn(model=actor_critic, fn_name="respond", accelerator=accelerator)
     actor_critic = accelerator.prepare(actor_critic)  # noqa
 
+    logger.warning("Initializing ref policy.")
     ref_policy = rl_models.make_policy_with_base_model(args, make_generative_policy(), tokenizer)
     ref_policy.requires_grad_(False)
     ref_policy = accelerator.prepare(ref_policy)  # noqa
 
+    logger.warning("Initializing reward model.")
     reward_model = make_reward_model()
     reward_model.requires_grad_(False)
     reward_model = accelerator.prepare(reward_model)
+    # input("Press Enter to continue...")
 
     # TODO: This is a hack to get FSDP running. Remove in the future when this is fixed.
     if accelerator.distributed_type == accelerate.DistributedType.FSDP:
+        # import time
+        # logger.warning(f'Start forward pass at time {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}')
         inputs = tokenizer("fsdp are you happy now??? :)" * 50, return_tensors="pt")
         inputs = {key: value.to(accelerator.device) for key, value in inputs.items()}
         actor_critic(inputs["input_ids"], inputs["attention_mask"], inputs["input_ids"])
+        # logger.warning(f'End forward pass at time {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}')
 
     return dict(policy=actor_critic, ref_policy=ref_policy, reward_model=reward_model)
