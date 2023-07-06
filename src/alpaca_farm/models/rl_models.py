@@ -106,6 +106,39 @@ class AutoregressivePolicy(Policy):
             last_hidden_state=last_hidden_state,
         )
 
+    def forward2(
+        self,
+        input_ids: Tensor,
+        temperature: Optional[float] = None,
+    ) -> Dict[str, Tensor]:
+        # TODO(lxuechen): Refactor attention mask. Here query_attn_masks overrides padding-based attention mask.
+        if temperature is None:
+            temperature = self.args.temperature
+        # input_ids = torch.cat([queries, responses], dim=1)
+        attention_mask = input_ids.ne(self.base_tokenizer.pad_token_id)
+        # attention_mask[:, : queries.size(1)] = query_attn_masks
+        # Fix position id issues and ensure consistency with `respond` for GPT and OPT.
+        inputs = self.base_model.prepare_inputs_for_generation(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+        outputs = self.base_model(**inputs, output_hidden_states=True)
+        original_logits = outputs.logits[:, -self.args.response_len - 1 : -1]
+        logits = original_logits / temperature
+        labels = input_ids[:, -self.args.response_len :]
+        logprobs = torch_ops.compute_logprobs(logits, labels, ignore_index=self.base_tokenizer.pad_token_id)
+        # entropies = -(logits.softmax(dim=-1) * logits.log_softmax(dim=-1)).sum(dim=-1)
+        # last_hidden_state = outputs.hidden_states[-1][:, -self.args.response_len - 1 : -1]
+        # return dict(
+        #     original_logits=original_logits,
+        #     logits=logits,
+        #     logprobs=logprobs,
+        #     entropies=entropies,
+        #     last_hidden_state=last_hidden_state,
+        # )
+        return logprobs
+
     def _respond(
         self,
         queries: Tensor,

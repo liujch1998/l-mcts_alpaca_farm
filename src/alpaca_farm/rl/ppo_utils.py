@@ -41,6 +41,7 @@ class DataArguments:
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     mode: str = field(default='train')
+    report_value: bool = field(default=False)
     use_value_in_decoding: bool = field(default=False)
     wandb_project: str = field(default=constants.WANDB_PROJECT)
     cache_dir: Optional[str] = field(default=constants.DEFAULT_CACHE_DIR)

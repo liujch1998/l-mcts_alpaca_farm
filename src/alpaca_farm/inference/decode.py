@@ -113,8 +113,12 @@ class HFDecodingArguments:
     num_return_sequences: int = 1
 
 class MyLogitsProcessor(transformers.LogitsProcessor):
-    def __init__(self, value_model):
+    def __init__(self, args, value_model, policy, ref_policy, reward):
+        self.args = args
         self.value_model = value_model
+        self.policy = policy
+        self.ref_policy = ref_policy
+        self.reward = reward
         from collections import defaultdict
         self.records = defaultdict(list)
 
@@ -123,13 +127,27 @@ class MyLogitsProcessor(transformers.LogitsProcessor):
         input_ids: (B, L)
         scores: (B, V)
         '''
-        k = 5
-        topk_indices = torch.topk(scores, k=k, dim=-1).indices # (B, K)
-        flattened_topk_indices = topk_indices.view(-1, 1) # (B * K, 1)
-        extended_input_ids = input_ids.repeat_interleave(k, dim=0) # (B * K, L)
-        extended_input_ids = torch.cat([extended_input_ids, flattened_topk_indices], dim=-1) # (B * K, L + 1)
-        values = self.value_model.forward2(extended_input_ids) # (B * K)
-        values = values.view(-1, k) # (B, K)
+        K = 2
+        topk_indices = torch.topk(scores, k=K, dim=-1).indices # (B, K)
+        values = []
+        shaped_rewardss = []
+        for k in range(K):
+            extended_input_ids = torch.cat([input_ids, topk_indices[:, k:k+1]], dim=-1) # (B, L + 1)
+            with torch.no_grad():
+                value = self.value_model.forward2(extended_input_ids) # (B)
+                logprobs = self.policy.forward2(extended_input_ids) # (B, L)
+                ref_logprobs = self.ref_policy.forward2(extended_input_ids) # (B, L)
+                kl = torch.clamp(logprobs - ref_logprobs, min=0.0)
+                non_score_rewards = -0.0067 * kl # -self.kl_ctl.value * kl # TODO: remove the KL hard coding
+                non_score_rewards = non_score_rewards[:, -1] # (B) # this is already the KL at the second last position, using the last token as label
+                scores = self.reward(extended_input_ids).rewards # (B)
+                scores = scores * (topk_indices[:, k:k+1] == self.policy.base_tokenizer.eos_token_id).float() # (B)
+                shaped_rewards = non_score_rewards + scores
+            values.append(value)
+            shaped_rewardss.append(shaped_rewards)
+        values = torch.stack(values, dim=-1) # (B, K)
+        shaped_rewardss = torch.stack(shaped_rewardss, dim=-1) # (B, K)
+        qs = shaped_rewardss + self.args.gamma * values
         B = input_ids.size(0)
         for b in range(B):
             self.records[b].append({
@@ -138,9 +156,16 @@ class MyLogitsProcessor(transformers.LogitsProcessor):
                 'topk_token_ids': topk_indices[b].tolist(), # (K)
                 'topk_tokens': self.value_model.base_tokenizer.batch_decode([[_] for _ in topk_indices[b].tolist()]),
                 'topk_logits': scores[b, topk_indices[b]].tolist(),
+                'topk_qs': qs[b].tolist(),
                 'topk_values': values[b].tolist(),
+                'topk_shaped_rewardss': shaped_rewardss[b].tolist(),
             })
-        return scores
+        if self.args.use_value_in_decoding:
+            new_scores = torch.full_like(scores, -1e9)
+            new_scores.scatter_(dim=1, index=topk_indices, src=qs)
+            return new_scores
+        else:
+            return scores
 
 @torch.inference_mode()
 def decode_prompts_with_huggingface_given_model(
@@ -160,7 +185,11 @@ def decode_prompts_with_huggingface_given_model(
     seed: Optional[int] = None,
     communication_num_chunks=1,
     tokenization_batch_size=1000,
+    args = None,
     value_model: Optional[torch.nn.Module] = None,
+    policy = None,
+    ref_policy = None,
+    reward = None,
     **decoding_kwargs,
 ) -> Union[List[List[str]], List[str]]:
     """Decode from a given model a sequence of string prompts."""
@@ -198,7 +227,7 @@ def decode_prompts_with_huggingface_given_model(
     # TODO(lxuechen): Refactor to tokenize upfront. This way we can pad with tokenizer, and not worry ourselves.
 
     completions = []
-    logits_processor = MyLogitsProcessor(value_model=value_model)
+    logits_processor = MyLogitsProcessor(args=args, value_model=value_model, policy=policy, ref_policy=ref_policy, reward=reward)
     for batch_idx, start_idx in tqdm.tqdm(
         enumerate(range(0, len(new_prompts), per_device_batch_size)),  # Increase the index by the actual batch size.
         desc="decoding batches",
@@ -213,8 +242,10 @@ def decode_prompts_with_huggingface_given_model(
 
         if batch_idx == 0:  # FSDP is buggy; we do a forward pass first to make it happy
             model(input_ids=inputs, attention_mask=attention_mask)
-            if value_model is not None:
+            if args.report_value:
                 value_model(queries=inputs, query_attn_masks=attention_mask, responses=inputs)
+                policy(queries=inputs, query_attn_masks=attention_mask, responses=inputs)
+                ref_policy(queries=inputs, query_attn_masks=attention_mask, responses=inputs)
 
         if (
             internal_batch_return_sequences is not None
@@ -264,7 +295,7 @@ def decode_prompts_with_huggingface_given_model(
                     f"num_return_sequences ({decoding_args.num_return_sequences}). Not batching over return sequences."
                 )
 
-            if value_model is not None:
+            if args.report_value:
                 # values = value_model(queries=inputs, query_attn_masks=attention_mask, responses=sequences).values # (B, Lr)
                 sequences = model.generate(inputs=inputs, attention_mask=attention_mask, logits_processor=[logits_processor], **generate_kwargs)
             else:

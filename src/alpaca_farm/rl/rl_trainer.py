@@ -239,7 +239,11 @@ class RLTrainer(object):
             divide_work=False,
             # mixed_precision='bf16', # to suppress the mixed_precision fallback to fp32 warning # BUGGY, do not use
             # value_model=unwrapped_value if self.args.use_value_in_decoding else None,
-            value_model=self.policy.value_model if self.args.use_value_in_decoding else None,
+            args=self.args,
+            value_model=self.policy.value_model,
+            policy=self.policy.policy,
+            ref_policy=self.ref_policy,
+            reward=self.reward_model,
         )
         # logger.warning(f'End decoding at time {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}')
         sequences = [i + o for i, o in utils.zip_(prompts, outputs)]
