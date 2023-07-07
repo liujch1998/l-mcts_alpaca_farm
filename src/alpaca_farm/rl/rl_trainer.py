@@ -211,8 +211,8 @@ class RLTrainer(object):
         if any(item is None for item in (prompts, list_dict_data)):
             logger.warning("No evaluation data, skipping evaluation.", main_process_only=True)
             return
-        prompts = prompts[:self.args.per_device_eval_batch_size]
-        list_dict_data = list_dict_data[:self.args.per_device_eval_batch_size]
+        prompts = prompts[1:1+self.args.per_device_eval_batch_size]
+        list_dict_data = list_dict_data[1:1+self.args.per_device_eval_batch_size]
 
         # Constants.
         model_name = Path(self.args.output_dir).stem  # Don't use the helper in common, as no checkpoint is saved yet.
@@ -264,7 +264,7 @@ class RLTrainer(object):
                 for reward, output, record, example in utils.zip_(rewards, outputs, records, list_dict_data)
             ]
             if self.args.output_dir is not None:
-                utils.jdump(results, utils.join(self.args.output_dir, f"eval_results_{step_idx}.json"))
+                utils.jdump(results, utils.join(self.args.output_dir, f"eval_{self.args.run_name}.json"))
 
             logger.warning(f"End evaluation at step: {step_idx}. Processed {len(results)} examples")
 

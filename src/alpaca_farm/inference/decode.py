@@ -163,6 +163,8 @@ class MyLogitsProcessor(transformers.LogitsProcessor):
                 'topk_values': values[b].tolist(),
                 'topk_shaped_rewards': shaped_rewards[b].tolist(),
             })
+        # logger.warning(f'input_ids: {input_ids[0]}')
+        # logger.warning(f'qs: {qs[0]}')
         if self.args.use_value_in_decoding:
             new_scores = torch.full_like(scores, -1e9)
             new_scores.scatter_(dim=1, index=topk_indices, src=qs)
@@ -172,7 +174,7 @@ class MyLogitsProcessor(transformers.LogitsProcessor):
 
 @torch.inference_mode()
 def decode_prompts_with_huggingface_given_model(
-    model: transformers.PreTrainedModel,
+    model: transformers.PreTrainedModel, # this is not used in MCTS
     tokenizer: transformers.PreTrainedTokenizer,
     prompts: Sequence[str],
     decoding_args: HFDecodingArguments,
@@ -189,7 +191,7 @@ def decode_prompts_with_huggingface_given_model(
     communication_num_chunks=1,
     tokenization_batch_size=1000,
     args = None,
-    value_model: Optional[torch.nn.Module] = None,
+    value_model = None,
     policy = None,
     ref_policy = None,
     reward = None,
@@ -229,6 +231,7 @@ def decode_prompts_with_huggingface_given_model(
         new_prompts = new_prompts[local_rank * per_worker_size : (local_rank + 1) * per_worker_size]
     # TODO(lxuechen): Refactor to tokenize upfront. This way we can pad with tokenizer, and not worry ourselves.
 
+    records = []
     completions = []
     for batch_idx, start_idx in tqdm.tqdm(
         enumerate(range(0, len(new_prompts), per_device_batch_size)),  # Increase the index by the actual batch size.
@@ -244,13 +247,13 @@ def decode_prompts_with_huggingface_given_model(
 
         if batch_idx == 0:  # FSDP is buggy; we do a forward pass first to make it happy
             model(input_ids=inputs, attention_mask=attention_mask)
-            if args.report_value:
-                # value_model(queries=inputs, query_attn_masks=attention_mask, responses=inputs)
-                # policy(queries=inputs, query_attn_masks=attention_mask, responses=inputs)
-                # ref_policy(queries=inputs, query_attn_masks=attention_mask, responses=inputs)
-                value_model.forward2(inputs)
-                policy.forward2(inputs)
-                ref_policy.forward2(inputs)
+            # if args.report_value:
+            #     # value_model(queries=inputs, query_attn_masks=attention_mask, responses=inputs)
+            #     # policy(queries=inputs, query_attn_masks=attention_mask, responses=inputs)
+            #     # ref_policy(queries=inputs, query_attn_masks=attention_mask, responses=inputs)
+            #     value_model.forward2(inputs)
+            #     policy.forward2(inputs)
+            #     ref_policy.forward2(inputs)
 
         if (
             internal_batch_return_sequences is not None
@@ -301,19 +304,26 @@ def decode_prompts_with_huggingface_given_model(
                 )
 
             if args.use_mcts:
-                # pass
-                num_actions = policy.base_tokenizer.vocab_size
+                num_actions = policy.base_tokenizer.vocab_size + 1 # LJC: why do we need +1 here?
                 # LJC: setting penalty to a small positive value to get around error
-                MCTS = BatchedMCTS(value_model, policy, ref_policy, reward, batch_size=args.per_device_eval_batch_size, num_simulations=10, num_actions=num_actions, num_sparse_actions=5, pb_c_init=8, temperature=1.0, penalty=0.01, rollout_size=0, logger=logger)
+                MCTS = BatchedMCTS(value_model, policy, ref_policy, reward, batch_size=args.per_device_eval_batch_size, num_simulations=10, num_actions=num_actions, num_sparse_actions=5, pb_c_init=8, temperature=1.0, penalty=0.0001, rollout_size=0, logger=logger)
                 for i in range(args.response_len):
+                    logger.warning('----------------')
+                    logger.warning(f'Decoding token {i}')
                     res_search = MCTS.search(source)
-                    source.input_ids = torch.cat((source.input_ids, torch.unsqueeze(torch.tensor(np.argmax(res_search, axis=1), dtype=torch.long, device=source.input_ids.device), dim=1)), dim=1)
+                    new_token_ids = torch.tensor(np.argmax(res_search, axis=1), dtype=torch.long, device=source.input_ids.device)
+                    source.input_ids = torch.cat([source.input_ids, torch.unsqueeze(new_token_ids, dim=1)], dim=1)
                     source.attention_mask = torch.cat((source.attention_mask, torch.unsqueeze(torch.ones_like(source.attention_mask[:, 0]), dim=1)), dim=1)
+                    
+                    logger.warning(f'New token id: {new_token_ids[0]}, new token: "{tokenizer.decode(new_token_ids[0])}"')
+                    logger.warning(f'Response so far: "{tokenizer.decode(source.input_ids[0, inputs.shape[1]:])}"')
+                    logger.warning('')
+                    # TODO: Add records
                 sequences = source.input_ids
             elif args.report_value:
                 logits_processor = MyLogitsProcessor(args=args, value_model=value_model, policy=policy, ref_policy=ref_policy, reward=reward)
-                # values = value_model(queries=inputs, query_attn_masks=attention_mask, responses=sequences).values # (B, Lr)
                 sequences = model.generate(inputs=inputs, attention_mask=attention_mask, logits_processor=[logits_processor], **generate_kwargs)
+                records += [logits_processor.records[b] for b in range(len(logits_processor.records))]
             else:
                 sequences = model.generate(inputs=inputs, attention_mask=attention_mask, **generate_kwargs)
             if not model.config.is_encoder_decoder:
@@ -364,9 +374,6 @@ def decode_prompts_with_huggingface_given_model(
 
     text_sequences = text_sequences[:ori_data_size]
 
-    records = []
-    if args.report_value:
-        records = [logits_processor.records[b] for b in range(len(logits_processor.records))]
     records = records[:ori_data_size]
     if len(records) < ori_data_size:
         records += [None] * (ori_data_size - len(records))
