@@ -17,6 +17,8 @@ import dataclasses
 import math
 import sys
 from typing import Callable, List, Optional, Sequence, Tuple, Union
+from collections import defaultdict
+import numpy as np
 
 import einops
 import torch
@@ -24,6 +26,7 @@ import tqdm
 import transformers
 
 from .. import common, constants, distributed_utils, logging, torch_ops, utils
+from alpaca_farm.inference.mcts import BatchedMCTS
 
 logger = logging.get_logger(__name__)
 
@@ -119,7 +122,6 @@ class MyLogitsProcessor(transformers.LogitsProcessor):
         self.policy = policy
         self.ref_policy = ref_policy
         self.reward = reward
-        from collections import defaultdict
         self.records = defaultdict(list)
 
     def __call__(self, input_ids, scores):
@@ -129,25 +131,26 @@ class MyLogitsProcessor(transformers.LogitsProcessor):
         '''
         K = 2
         topk_indices = torch.topk(scores, k=K, dim=-1).indices # (B, K)
-        values = []
+        valuess = []
         shaped_rewardss = []
         for k in range(K):
             extended_input_ids = torch.cat([input_ids, topk_indices[:, k:k+1]], dim=-1) # (B, L + 1)
             with torch.no_grad():
-                value = self.value_model.forward2(extended_input_ids) # (B)
+                values = self.value_model.forward2(extended_input_ids) # (B)
+                values = values * (topk_indices[:, k] != self.policy.base_tokenizer.eos_token_id) # (B)
                 logprobs = self.policy.forward2(extended_input_ids) # (B, L)
                 ref_logprobs = self.ref_policy.forward2(extended_input_ids) # (B, L)
-                kl = torch.clamp(logprobs - ref_logprobs, min=0.0)
+                kl = torch.clamp(logprobs - ref_logprobs, min=0.0) # TODO: do we really need clamping???
                 non_score_rewards = -0.0067 * kl # -self.kl_ctl.value * kl # TODO: remove the KL hard coding
                 non_score_rewards = non_score_rewards[:, -1] # (B) # this is already the KL at the second last position, using the last token as label
-                scores = self.reward(extended_input_ids).rewards # (B)
-                scores = scores * (topk_indices[:, k:k+1] == self.policy.base_tokenizer.eos_token_id).float() # (B)
-                shaped_rewards = non_score_rewards + scores
-            values.append(value)
+                rewards = self.reward(extended_input_ids).rewards # (B)
+                rewards = rewards * (topk_indices[:, k] == self.policy.base_tokenizer.eos_token_id) # (B)
+                shaped_rewards = non_score_rewards + rewards
+            valuess.append(values)
             shaped_rewardss.append(shaped_rewards)
-        values = torch.stack(values, dim=-1) # (B, K)
-        shaped_rewardss = torch.stack(shaped_rewardss, dim=-1) # (B, K)
-        qs = shaped_rewardss + self.args.gamma * values
+        values = torch.stack(valuess, dim=-1) # (B, K)
+        shaped_rewards = torch.stack(shaped_rewardss, dim=-1) # (B, K)
+        qs = shaped_rewards + self.args.gamma * values
         B = input_ids.size(0)
         for b in range(B):
             self.records[b].append({
@@ -158,7 +161,7 @@ class MyLogitsProcessor(transformers.LogitsProcessor):
                 'topk_logits': scores[b, topk_indices[b]].tolist(),
                 'topk_qs': qs[b].tolist(),
                 'topk_values': values[b].tolist(),
-                'topk_shaped_rewardss': shaped_rewardss[b].tolist(),
+                'topk_shaped_rewards': shaped_rewards[b].tolist(),
             })
         if self.args.use_value_in_decoding:
             new_scores = torch.full_like(scores, -1e9)
@@ -227,7 +230,6 @@ def decode_prompts_with_huggingface_given_model(
     # TODO(lxuechen): Refactor to tokenize upfront. This way we can pad with tokenizer, and not worry ourselves.
 
     completions = []
-    logits_processor = MyLogitsProcessor(args=args, value_model=value_model, policy=policy, ref_policy=ref_policy, reward=reward)
     for batch_idx, start_idx in tqdm.tqdm(
         enumerate(range(0, len(new_prompts), per_device_batch_size)),  # Increase the index by the actual batch size.
         desc="decoding batches",
@@ -243,9 +245,12 @@ def decode_prompts_with_huggingface_given_model(
         if batch_idx == 0:  # FSDP is buggy; we do a forward pass first to make it happy
             model(input_ids=inputs, attention_mask=attention_mask)
             if args.report_value:
-                value_model(queries=inputs, query_attn_masks=attention_mask, responses=inputs)
-                policy(queries=inputs, query_attn_masks=attention_mask, responses=inputs)
-                ref_policy(queries=inputs, query_attn_masks=attention_mask, responses=inputs)
+                # value_model(queries=inputs, query_attn_masks=attention_mask, responses=inputs)
+                # policy(queries=inputs, query_attn_masks=attention_mask, responses=inputs)
+                # ref_policy(queries=inputs, query_attn_masks=attention_mask, responses=inputs)
+                value_model.forward2(inputs)
+                policy.forward2(inputs)
+                ref_policy.forward2(inputs)
 
         if (
             internal_batch_return_sequences is not None
@@ -296,6 +301,7 @@ def decode_prompts_with_huggingface_given_model(
                 )
 
             if args.report_value:
+                logits_processor = MyLogitsProcessor(args=args, value_model=value_model, policy=policy, ref_policy=ref_policy, reward=reward)
                 # values = value_model(queries=inputs, query_attn_masks=attention_mask, responses=sequences).values # (B, Lr)
                 sequences = model.generate(inputs=inputs, attention_mask=attention_mask, logits_processor=[logits_processor], **generate_kwargs)
             else:
@@ -348,7 +354,9 @@ def decode_prompts_with_huggingface_given_model(
 
     text_sequences = text_sequences[:ori_data_size]
 
-    records = [logits_processor.records[b] for b in range(len(logits_processor.records))]
+    records = []
+    if args.report_value:
+        records = [logits_processor.records[b] for b in range(len(logits_processor.records))]
     records = records[:ori_data_size]
     if len(records) < ori_data_size:
         records += [None] * (ori_data_size - len(records))

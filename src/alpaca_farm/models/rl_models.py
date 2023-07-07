@@ -124,9 +124,11 @@ class AutoregressivePolicy(Policy):
             use_cache=False,
         )
         outputs = self.base_model(**inputs, output_hidden_states=True)
-        original_logits = outputs.logits[:, -self.args.response_len - 1 : -1]
+        # original_logits = outputs.logits[:, -self.args.response_len - 1 : -1]
+        original_logits = outputs.logits[:, :-1]
         logits = original_logits / temperature
-        labels = input_ids[:, -self.args.response_len :]
+        # labels = input_ids[:, -self.args.response_len :]
+        labels = input_ids[:, 1:]
         logprobs = torch_ops.compute_logprobs(logits, labels, ignore_index=self.base_tokenizer.pad_token_id)
         # entropies = -(logits.softmax(dim=-1) * logits.log_softmax(dim=-1)).sum(dim=-1)
         # last_hidden_state = outputs.hidden_states[-1][:, -self.args.response_len - 1 : -1]

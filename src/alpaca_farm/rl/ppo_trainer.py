@@ -462,6 +462,18 @@ def make_models(
         utils.stable_resize_token_embeddings(base_model, len(tokenizer))
         return base_model
 
+    def make_generative_ref_policy():
+        base_model = common.make_generative_lm(
+            model_name_or_path=args.ref_policy_model_name_or_path,
+            flash_attn=args.flash_attn,
+            mixed_precision=accelerator.mixed_precision,
+            cache_dir=args.cache_dir,
+            low_cpu_mem_usage=True,
+            # device_map={"": accelerator.device},
+        )
+        utils.stable_resize_token_embeddings(base_model, len(tokenizer))
+        return base_model
+
     def make_value_model():
         return value_model_module.ValueModel.from_pretrained(
             args.value_model_name_or_path,
@@ -511,7 +523,7 @@ def make_models(
     actor_critic = accelerator.prepare(actor_critic)  # noqa
 
     logger.warning("Initializing ref policy.")
-    ref_policy = rl_models.make_policy_with_base_model(args, make_generative_policy(), tokenizer)
+    ref_policy = rl_models.make_policy_with_base_model(args, make_generative_ref_policy(), tokenizer)
     ref_policy.requires_grad_(False)
     ref_policy = accelerator.prepare(ref_policy)  # noqa
 
@@ -525,9 +537,11 @@ def make_models(
     if accelerator.distributed_type == accelerate.DistributedType.FSDP:
         # import time
         # logger.warning(f'Start forward pass at time {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}')
-        inputs = tokenizer("fsdp are you happy now??? :)" * 50, return_tensors="pt")
-        inputs = {key: value.to(accelerator.device) for key, value in inputs.items()}
-        actor_critic(inputs["input_ids"], inputs["attention_mask"], inputs["input_ids"])
+        with torch.no_grad():
+            inputs = tokenizer("fsdp are you happy now??? :)" * 50, return_tensors="pt")
+            inputs = {key: value.to(accelerator.device) for key, value in inputs.items()}
+            actor_critic(inputs["input_ids"], inputs["attention_mask"], inputs["input_ids"])
+            ref_policy(inputs["input_ids"], inputs["attention_mask"], inputs["input_ids"])
         # logger.warning(f'End forward pass at time {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}')
 
     return dict(policy=actor_critic, ref_policy=ref_policy, reward_model=reward_model)

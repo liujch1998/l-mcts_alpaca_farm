@@ -43,6 +43,7 @@ class TrainingArguments(transformers.TrainingArguments):
     mode: str = field(default='train')
     report_value: bool = field(default=False)
     use_value_in_decoding: bool = field(default=False)
+    use_mcts: bool = field(default=False)
     wandb_project: str = field(default=constants.WANDB_PROJECT)
     cache_dir: Optional[str] = field(default=constants.DEFAULT_CACHE_DIR)
     flash_attn: bool = field(default=False)
@@ -103,6 +104,7 @@ class TrainingArguments(transformers.TrainingArguments):
     query_len: int = field(default=192)
     response_len: int = field(default=300)
     policy_model_name_or_path: str = field(default=None)
+    ref_policy_model_name_or_path: str = field(default=None)
     value_model_name_or_path: str = field(default=None)
     reward_model_name_or_path: str = field(default=None)
     use_fast_tokenizer: bool = field(
