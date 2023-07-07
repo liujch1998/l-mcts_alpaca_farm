@@ -300,7 +300,17 @@ def decode_prompts_with_huggingface_given_model(
                     f"num_return_sequences ({decoding_args.num_return_sequences}). Not batching over return sequences."
                 )
 
-            if args.report_value:
+            if args.use_mcts:
+                # pass
+                num_actions = policy.base_tokenizer.vocab_size
+                # LJC: setting penalty to a small positive value to get around error
+                MCTS = BatchedMCTS(value_model, policy, ref_policy, reward, batch_size=args.per_device_eval_batch_size, num_simulations=10, num_actions=num_actions, num_sparse_actions=5, pb_c_init=8, temperature=1.0, penalty=0.01, rollout_size=0, logger=logger)
+                for i in range(args.response_len):
+                    res_search = MCTS.search(source)
+                    source.input_ids = torch.cat((source.input_ids, torch.unsqueeze(torch.tensor(np.argmax(res_search, axis=1), dtype=torch.long, device=source.input_ids.device), dim=1)), dim=1)
+                    source.attention_mask = torch.cat((source.attention_mask, torch.unsqueeze(torch.ones_like(source.attention_mask[:, 0]), dim=1)), dim=1)
+                sequences = source.input_ids
+            elif args.report_value:
                 logits_processor = MyLogitsProcessor(args=args, value_model=value_model, policy=policy, ref_policy=ref_policy, reward=reward)
                 # values = value_model(queries=inputs, query_attn_masks=attention_mask, responses=sequences).values # (B, Lr)
                 sequences = model.generate(inputs=inputs, attention_mask=attention_mask, logits_processor=[logits_processor], **generate_kwargs)
