@@ -541,7 +541,7 @@ def make_models(
             inputs = tokenizer("fsdp are you happy now??? :)" * 50, return_tensors="pt")
             inputs = {key: value.to(accelerator.device) for key, value in inputs.items()}
             actor_critic(inputs["input_ids"], inputs["attention_mask"], inputs["input_ids"])
-            ref_policy(inputs["input_ids"], inputs["attention_mask"], inputs["input_ids"])
+            ref_policy(inputs["input_ids"], inputs["attention_mask"], inputs["input_ids"]) # LJC: This is probably not needed
         # logger.warning(f'End forward pass at time {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}')
 
     return dict(policy=actor_critic, ref_policy=ref_policy, reward_model=reward_model)

@@ -211,8 +211,8 @@ class RLTrainer(object):
         if any(item is None for item in (prompts, list_dict_data)):
             logger.warning("No evaluation data, skipping evaluation.", main_process_only=True)
             return
-        prompts = prompts[1:1+self.args.per_device_eval_batch_size]
-        list_dict_data = list_dict_data[1:1+self.args.per_device_eval_batch_size]
+        prompts = prompts[:4*self.args.per_device_eval_batch_size]
+        list_dict_data = list_dict_data[:4*self.args.per_device_eval_batch_size]
 
         # Constants.
         model_name = Path(self.args.output_dir).stem  # Don't use the helper in common, as no checkpoint is saved yet.

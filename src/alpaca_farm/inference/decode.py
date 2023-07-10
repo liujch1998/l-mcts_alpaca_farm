@@ -143,7 +143,9 @@ class MyLogitsProcessor(transformers.LogitsProcessor):
                 kl = torch.clamp(logprobs - ref_logprobs, min=0.0) # TODO: do we really need clamping???
                 non_score_rewards = -0.0067 * kl # -self.kl_ctl.value * kl # TODO: remove the KL hard coding
                 non_score_rewards = non_score_rewards[:, -1] # (B) # this is already the KL at the second last position, using the last token as label
-                rewards = self.reward(extended_input_ids).rewards # (B)
+                mask = (extended_input_ids != self.policy.base_tokenizer.pad_token_id)
+                rewards = self.reward(extended_input_ids, attention_mask=mask).rewards # (B)
+                rewards = rewards.to(non_score_rewards.dtype) # TODO: Remove this temporary workaround, rewards should be in bf16 in theory but it is giving fp32
                 rewards = rewards * (topk_indices[:, k] == self.policy.base_tokenizer.eos_token_id) # (B)
                 shaped_rewards = non_score_rewards + rewards
             valuess.append(values)
@@ -151,6 +153,7 @@ class MyLogitsProcessor(transformers.LogitsProcessor):
         values = torch.stack(valuess, dim=-1) # (B, K)
         shaped_rewards = torch.stack(shaped_rewardss, dim=-1) # (B, K)
         qs = shaped_rewards + self.args.gamma * values
+        # qs = values
         B = input_ids.size(0)
         for b in range(B):
             self.records[b].append({
@@ -306,7 +309,7 @@ def decode_prompts_with_huggingface_given_model(
             if args.use_mcts:
                 num_actions = policy.base_tokenizer.vocab_size + 1 # LJC: why do we need +1 here?
                 # LJC: setting penalty to a small positive value to get around error
-                MCTS = BatchedMCTS(value_model, policy, ref_policy, reward, batch_size=args.per_device_eval_batch_size, num_simulations=10, num_actions=num_actions, num_sparse_actions=5, pb_c_init=8, temperature=1.0, penalty=0.0001, rollout_size=0, logger=logger)
+                MCTS = BatchedMCTS(value_model, policy, ref_policy, reward, batch_size=args.per_device_eval_batch_size, num_simulations=10, num_actions=num_actions, num_sparse_actions=2, pb_c_init=8, temperature=1.0, rollout_size=0, logger=logger)
                 for i in range(args.response_len):
                     logger.warning('----------------')
                     logger.warning(f'Decoding token {i}')

@@ -11,8 +11,6 @@ import torch.nn.functional as F
 import argparse
 import logging
 
-from transformers import RepetitionPenaltyLogitsProcessor
-
 eos_token_id = 2 # LJC: remove this hard-coding
 
 
@@ -58,7 +56,7 @@ def pad_sequences_to_left_states(sequences, padding_value=0, max_len=0):
 
 
 class BatchedMCTS():
-    def __init__(self, value_model, policy, ref_policy, reward, batch_size, num_simulations, num_actions, num_sparse_actions, pb_c_init, temperature, penalty, rollout_size, logger):
+    def __init__(self, value_model, policy, ref_policy, reward, batch_size, num_simulations, num_actions, num_sparse_actions, pb_c_init, temperature, rollout_size, logger):
         self._value_model = value_model
         self._policy = policy
         self._ref_policy = ref_policy
@@ -84,7 +82,7 @@ class BatchedMCTS():
         self._num_nodes = num_nodes
         self._visit_counts = np.zeros(batch_node, dtype=np.int32)
         self._values = np.zeros(batch_node, dtype=np.float32)
-        self._raw_values = np.zeros(batch_node, dtype=np.float32)
+        # self._raw_values = np.zeros(batch_node, dtype=np.float32)
         self._parents = np.zeros(batch_node, dtype=np.int32)
         # action_from_parents[b, i] is the action taken to reach node i.
         # Note that action_from_parents[b, 0] will remain -1, as we do not know,
@@ -110,7 +108,6 @@ class BatchedMCTS():
         self._attention_mask = {}
         self._batch_range = np.arange(batch_size)
         self._reset_tree()
-        self._repetition_penalty = RepetitionPenaltyLogitsProcessor(penalty=penalty)
 
         self.logger = logger
         self.records = defaultdict(list)
@@ -126,13 +123,15 @@ class BatchedMCTS():
             kl = torch.clamp(logprobs - ref_logprobs, min=0.0)
             non_score_rewards = -0.0067 * kl # -self.kl_ctl.value * kl # TODO: remove the KL hard coding
             non_score_rewards = non_score_rewards[:, -1] # (B) # this is already the KL at the second last position, using the last token as label
-            rewards = self._reward(tokens_ids).rewards # (B)
+            mask = (tokens_ids != self._policy.base_tokenizer.pad_token_id)
+            rewards = self._reward(tokens_ids, attention_mask=mask).rewards # (B)
+            rewards = rewards.to(non_score_rewards.dtype) # TODO: Remove this temporary workaround, rewards should be in bf16 in theory but it is giving fp32
             rewards = rewards * (tokens_ids[:, -1] == self._policy.base_tokenizer.eos_token_id) # (B)
             shaped_rewards = non_score_rewards + rewards
             qs = shaped_rewards + 1.0 * values # TODO: remove the gamma hard coding
         return qs
 
-    def _root_fun(self, original_input, temperature, repetition_penalty):
+    def _root_fun(self, original_input, temperature):
         """Initialize roots scores"""
         # Forward pass of GPT-2 to get priors and states
         model_inputs = self._policy.base_model.prepare_inputs_for_generation(original_input.input_ids, attention_mask=original_input.attention_mask, use_cache=True)
@@ -145,10 +144,11 @@ class BatchedMCTS():
             )
             states = outputs.past_key_values
 
-            prompt_masked_input_ids = torch.clone(model_inputs["input_ids"])
-            inverted_attention_mask = model_inputs["attention_mask"] == 0
-            prompt_masked_input_ids[inverted_attention_mask]=14827
-            priors = repetition_penalty(prompt_masked_input_ids, outputs.logits[:, -1, :] / temperature)
+            # prompt_masked_input_ids = torch.clone(model_inputs["input_ids"])
+            # inverted_attention_mask = model_inputs["attention_mask"] == 0
+            # prompt_masked_input_ids[inverted_attention_mask]=14827
+            # priors = repetition_penalty(prompt_masked_input_ids, outputs.logits[:, -1, :] / temperature)
+            priors = outputs.logits[:, -1, :] / temperature
             priors = F.softmax(priors, dim=-1).float().cpu().numpy()
             
         # Use of our discriminator to get values
@@ -158,7 +158,7 @@ class BatchedMCTS():
         return priors, values, states
 
 
-    def _rec_fun(self, states, token_ids, attention_masks, temperature, repetition_penalty, rollout_size):
+    def _rec_fun(self, states, token_ids, attention_masks, temperature, rollout_size):
         """Get score from current nodes"""
         '''
         Inputs:
@@ -182,12 +182,13 @@ class BatchedMCTS():
 
             next_states = outputs.past_key_values
             
-            prompt_masked_input_ids = torch.clone(token_ids)
-            inverted_attention_mask = attention_masks == 0
+            # prompt_masked_input_ids = torch.clone(token_ids)
+            # inverted_attention_mask = attention_masks == 0
             #penalizing an unused token
-            prompt_masked_input_ids[inverted_attention_mask]=14827
+            # prompt_masked_input_ids[inverted_attention_mask]=14827
             
-            priors = repetition_penalty(prompt_masked_input_ids, outputs.logits[:, -1, :] / temperature)
+            # priors = repetition_penalty(prompt_masked_input_ids, outputs.logits[:, -1, :] / temperature)
+            priors = outputs.logits[:, -1, :] / temperature
             priors = F.softmax(priors, dim=-1)
             # LJC: The following rollout seems buggy, DO NOT USE before you fix it
             # if(rollout_size > 0):
@@ -236,11 +237,18 @@ class BatchedMCTS():
         self._token_ids = {} # Indexed by tuples (batch index, node index)
         self._attention_mask = {}
     
+    def print_tree(self, sim):
+        self.logger.warning(f'Current tree:')
+        for i in range(sim + 1): # sim + 1 is the current number of nodes
+            self.logger.warning(f'\tnode {i}: n={self._visit_counts[0, i]}, v={self._values[0, i]:.4f}, parent={self._parents[0, i]}, action_from_parent={self._action_from_parents[0, i]}, depth={self._depth[0, i]}, is_terminal={self._is_terminal[0, i]}')
+            for a in range(self._num_sparse_actions):
+                self.logger.warning(f'\t\taction {a}: token_id={self._topk_mapping[0, i, a]}, child_index={self._children_index[0, i, a]}, child_p={self._children_prior[0, i, a]:.4f}, child_v={self._children_values[0, i, a]:.4f}, child_n={self._children_visits[0, i, a]}')
+
     def search(self, original_input):
         self._reset_tree()
 
         # Evaluate the root.
-        prior, values, states = self._root_fun(original_input, self._temperature, self._repetition_penalty)
+        prior, values, states = self._root_fun(original_input, self._temperature)
 
        
         # self._adaptive_min_values = values
@@ -256,11 +264,13 @@ class BatchedMCTS():
         leaf_indices = np.zeros((self._batch_size), np.int32)
         for sim in range(self._num_simulations):
             self.logger.warning(f"Simulation #{sim}")
+            self.print_tree(sim)
             node_indices, actions = self.select()
             next_node_index = sim + 1 # root is 0, therefore we offset by 1.
             self.expand(node_indices, actions, next_node_index)
             leaf_indices.fill(next_node_index)
             self.backward(leaf_indices)
+            self.logger.warning('')
 
         # Final choice: most visited, max score, max mean score
         return self.dense_visit_counts()
@@ -294,14 +304,18 @@ class BatchedMCTS():
     # LJC: This is actually the selection step
     def select(self):
         """Goes down until all elements have reached unexplored actions."""
+        self.logger.warning('Selecting ...')
         node_indices = np.zeros((self._batch_size), np.int32)
         depth = 0
         while True:
+            self.logger.warning(f'\tdepth={depth}, node_index={node_indices[0]}')
             depth += 1
             actions = self.uct_select_action(node_indices)
+            self.logger.warning(f'\tselected_action={actions[0]}')
             next_node_indices = self._children_index[self._batch_range, node_indices, actions]
             is_unexplored = next_node_indices == -1
             if is_unexplored.all():
+                self.logger.warning(f'\tSelected node {node_indices[0]}, action {actions[0]}')
                 return node_indices, actions
             else:
                 node_indices = np.where(is_unexplored, node_indices, next_node_indices)
@@ -320,6 +334,8 @@ class BatchedMCTS():
         # node_value_score = (node_value_score - self._adaptive_min_values[:, None]) / (self._adaptive_max_values[:, None] - self._adaptive_min_values[:, None])
         
         node_uct_score = node_value_score + node_policy_score # (B, A)
+        for a in range(self._num_sparse_actions):
+            self.logger.warning(f'\t\taction {a}: policy_score={node_policy_score[0, a]:.4f}, value_score={node_value_score[0, a]:.4f}, uct_score={node_uct_score[0, a]:.4f}')
         actions = np.argmax(node_uct_score, axis=1)
         return actions
 
@@ -337,6 +353,7 @@ class BatchedMCTS():
 
     def expand(self, node_indices, actions, next_node_index):
         """Creates and evaluate child nodes from given nodes and unexplored actions."""
+        self.logger.warning('Expanding ...')
 
         # Retrieve token ids for nodes to be evaluated.
         tokens_ids = pad_sequences_to_left([self._token_ids[(b, n)] for b, n in enumerate(node_indices)], True, eos_token_id)
@@ -356,7 +373,7 @@ class BatchedMCTS():
         expanded_node_is_terminal = dense_actions == eos_token_id 
 
         # Evaluate nodes.
-        (prior, values, next_states) = self._rec_fun(states, tokens_ids, attention_masks, self._temperature, self._repetition_penalty, self.rollout_size)
+        (prior, values, next_states) = self._rec_fun(states, tokens_ids, attention_masks, self._temperature, self.rollout_size)
        
         # Create the new nodes.
         self.create_node(next_node_index, prior, values, next_states, tokens_ids, attention_masks, expanded_node_is_terminal)
@@ -372,6 +389,10 @@ class BatchedMCTS():
         self._parents[:, next_node_index] = node_indices
         self._action_from_parents[:, next_node_index] = actions
         self._depth[:, next_node_index] = self._depth[self._batch_range, node_indices] + 1
+
+        self.logger.warning(f'\tCreated node {next_node_index}: n={self._visit_counts[0, next_node_index]}, v={self._values[0, next_node_index]:.4f}, parent={self._parents[0, next_node_index]}, action_from_parent={self._action_from_parents[0, next_node_index]}, depth={self._depth[0, next_node_index]}, is_terminal={self._is_terminal[0, next_node_index]}')
+        for a in range(self._num_sparse_actions):
+            self.logger.warning(f'\t\taction {a}: token_id={self._topk_mapping[0, next_node_index, a]}, child_index={self._children_index[0, next_node_index, a]}, child_p={self._children_prior[0, next_node_index, a]:.4f}, child_v={self._children_values[0, next_node_index, a]:.4f}, child_n={self._children_visits[0, next_node_index, a]}')
         
     def create_node(self, node_index, prior, values, next_states, tokens_ids, attention_masks, expanded_node_is_terminal):
         """Create nodes with computed values"""
@@ -386,9 +407,9 @@ class BatchedMCTS():
         self._children_prior[:, node_index, :] = prior
 
         # raw_values = values**(self.alpha) * likelihoods**(1-self.alpha)
-        raw_values = values # LJC: removed the likelihood thing
-        self._values[:, node_index] = raw_values
-        self._raw_values[:, node_index] = raw_values
+        # raw_values = values # LJC: removed the likelihood thing
+        self._values[:, node_index] = values
+        # self._raw_values[:, node_index] = raw_values
         self._visit_counts[:, node_index] = 1
         self._is_terminal[:, node_index] = expanded_node_is_terminal
 
@@ -412,6 +433,7 @@ class BatchedMCTS():
 
     def backward(self, leaf_indices):
         """Goes up and updates the tree until all nodes reached the root."""
+        self.logger.warning(f'Backward ...')
         node_indices = leaf_indices # (B)
         leaf_values = self._values[self._batch_range, leaf_indices]
         while True:
