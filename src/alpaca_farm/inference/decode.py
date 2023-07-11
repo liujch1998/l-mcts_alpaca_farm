@@ -26,7 +26,8 @@ import tqdm
 import transformers
 
 from .. import common, constants, distributed_utils, logging, torch_ops, utils
-from alpaca_farm.inference.mcts import BatchedMCTS
+import alpaca_farm.inference.mcts as mcts
+import traceback
 
 logger = logging.get_logger(__name__)
 
@@ -198,6 +199,7 @@ def decode_prompts_with_huggingface_given_model(
     policy = None,
     ref_policy = None,
     reward = None,
+    accelerator = None,
     **decoding_kwargs,
 ) -> Union[List[List[str]], List[str]]:
     """Decode from a given model a sequence of string prompts."""
@@ -242,7 +244,13 @@ def decode_prompts_with_huggingface_given_model(
         total=len(new_prompts) // per_device_batch_size,
         disable=not distributed_utils.is_main_process(),
     ):
-        batch = new_prompts[start_idx : start_idx + per_device_batch_size]
+        if args.debug:
+            if accelerator.is_main_process:
+                input('Press enter to continue...')
+            accelerator.wait_for_everyone()
+            batch = new_prompts[:per_device_batch_size] # LJC: this is for debugging MCTS only!!!
+        else:
+            batch = new_prompts[start_idx : start_idx + per_device_batch_size]
 
         source = tokenizer(batch, return_tensors="pt", padding=True)
         source = common.prepare_inputs(source, device=device)
@@ -307,21 +315,17 @@ def decode_prompts_with_huggingface_given_model(
                 )
 
             if args.use_mcts:
-                num_actions = policy.base_tokenizer.vocab_size + 1 # LJC: why do we need +1 here?
-                # LJC: setting penalty to a small positive value to get around error
-                MCTS = BatchedMCTS(value_model, policy, ref_policy, reward, batch_size=args.per_device_eval_batch_size, num_simulations=10, num_actions=num_actions, num_sparse_actions=2, pb_c_init=8, temperature=1.0, rollout_size=0, logger=logger)
-                for i in range(args.response_len):
-                    logger.warning('----------------')
-                    logger.warning(f'Decoding token {i}')
-                    res_search = MCTS.search(source)
-                    new_token_ids = torch.tensor(np.argmax(res_search, axis=1), dtype=torch.long, device=source.input_ids.device)
-                    source.input_ids = torch.cat([source.input_ids, torch.unsqueeze(new_token_ids, dim=1)], dim=1)
-                    source.attention_mask = torch.cat((source.attention_mask, torch.unsqueeze(torch.ones_like(source.attention_mask[:, 0]), dim=1)), dim=1)
-                    
-                    logger.warning(f'New token id: {new_token_ids[0]}, new token: "{tokenizer.decode(new_token_ids[0])}"')
-                    logger.warning(f'Response so far: "{tokenizer.decode(source.input_ids[0, inputs.shape[1]:])}"')
-                    logger.warning('')
-                    # TODO: Add records
+                try:
+                    if args.debug:
+                        # Reload the BatchedMCTS class
+                        import importlib
+                        global mcts
+                        mcts = importlib.reload(mcts)
+                    MCTS = mcts.BatchedMCTS(tokenizer, value_model, policy, ref_policy, reward, batch_size=args.per_device_eval_batch_size)#, response_len=args.response_len, num_simulations=10, num_sparse_actions=2, pb_c_init=8, temperature=1.0, rollout_size=0, logger=logger)
+                    source = MCTS.generate(source)
+                except Exception as e:
+                    logger.error(traceback.format_exc())
+                    # logger.error(e)
                 sequences = source.input_ids
             elif args.report_value:
                 logits_processor = MyLogitsProcessor(args=args, value_model=value_model, policy=policy, ref_policy=ref_policy, reward=reward)

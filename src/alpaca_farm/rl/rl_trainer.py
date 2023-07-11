@@ -211,8 +211,12 @@ class RLTrainer(object):
         if any(item is None for item in (prompts, list_dict_data)):
             logger.warning("No evaluation data, skipping evaluation.", main_process_only=True)
             return
-        prompts = prompts[:4*self.args.per_device_eval_batch_size]
-        list_dict_data = list_dict_data[:4*self.args.per_device_eval_batch_size]
+        if self.args.debug:
+            prompts = prompts[:100]
+            list_dict_data = list_dict_data[:100]
+        else:
+            prompts = prompts[:4*self.args.per_device_eval_batch_size]
+            list_dict_data = list_dict_data[:4*self.args.per_device_eval_batch_size]
 
         # Constants.
         model_name = Path(self.args.output_dir).stem  # Don't use the helper in common, as no checkpoint is saved yet.
@@ -244,6 +248,7 @@ class RLTrainer(object):
             policy=self.policy.policy,
             ref_policy=self.ref_policy,
             reward=self.reward_model,
+            accelerator=self.accelerator,
         )
         # logger.warning(f'End decoding at time {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}')
         sequences = [i + o for i, o in utils.zip_(prompts, outputs)]
