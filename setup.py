@@ -49,6 +49,9 @@ setuptools.setup(
         "fire",
         "openai",
         "alpaca_eval",
+        "networkx",
+        "pydot",
+        "graphviz",
     ],
     extras_require={
         "full": [
@@ -69,7 +72,7 @@ setuptools.setup(
             "isort",
         },
     },
-    python_requires=">=3.10",
+    python_requires=">=3.9",
     classifiers=[
         "Intended Audience :: Developers",
         "Intended Audience :: Education",

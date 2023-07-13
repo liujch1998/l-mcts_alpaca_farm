@@ -90,3 +90,25 @@ class ValueModel(transformers.PreTrainedModel):
         values = self.reward_head(last_hidden_state).squeeze(-1) # (B)
         # print(input_ids, last_hidden_state, values)
         return values
+
+    def forward2_fast(self, input_ids, states=None):
+        '''
+        input_ids: (B, Lq+Lr)
+        return: values (B)
+        '''
+        attn_masks = input_ids.ne(self.base_tokenizer.pad_token_id)
+        inputs = self.backbone_model.prepare_inputs_for_generation(
+            input_ids=input_ids,
+            attention_mask=attn_masks,
+            use_cache=True,
+            past_key_values=states,
+        )
+        # if states:
+        #     print(f'Value -- input_ids: {inputs["input_ids"].size()}, attention_mask: {inputs["attention_mask"].size()}, past_key_values: {inputs["past_key_values"][0][0].size()}')
+        # else:
+        #     print(f'Value -- input_ids: {inputs["input_ids"].size()}, attention_mask: {inputs["attention_mask"].size()}')
+        outputs = self.backbone_model.model(**inputs, return_dict=True) # (B, Lq+Lr, V)
+        last_hidden_state = outputs.last_hidden_state[:, -1, :] # (B, V)
+        values = self.reward_head(last_hidden_state).squeeze(-1) # (B)
+        # print(input_ids, last_hidden_state, values)
+        return dict(values=values, next_states=outputs.past_key_values)

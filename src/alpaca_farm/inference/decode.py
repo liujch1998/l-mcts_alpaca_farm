@@ -321,7 +321,7 @@ def decode_prompts_with_huggingface_given_model(
                         import importlib
                         global mcts
                         mcts = importlib.reload(mcts)
-                    MCTS = mcts.BatchedMCTS(tokenizer, value_model, policy, ref_policy, reward, batch_size=args.per_device_eval_batch_size)#, response_len=args.response_len, num_simulations=10, num_sparse_actions=2, pb_c_init=8, temperature=1.0, rollout_size=0, logger=logger)
+                    MCTS = mcts.BatchedMCTS(tokenizer, value_model, policy, ref_policy, reward, batch_size=args.per_device_eval_batch_size, response_len=args.response_len, visualize=args.debug, init_v_with_parent=args.init_v_with_parent)#, num_simulations=10, num_sparse_actions=2, pb_c_init=8, temperature=1.0, rollout_size=0, logger=logger)
                     source = MCTS.generate(source)
                 except Exception as e:
                     logger.error(traceback.format_exc())

@@ -212,6 +212,8 @@ class RLTrainer(object):
             logger.warning("No evaluation data, skipping evaluation.", main_process_only=True)
             return
         if self.args.debug:
+            self.args.per_device_eval_batch_size = 1
+            self.args.response_len = 1
             prompts = prompts[:100]
             list_dict_data = list_dict_data[:100]
         else:
@@ -238,7 +240,7 @@ class RLTrainer(object):
             model=unwrapped_policy,
             tokenizer=self.tokenizer,
             prompts=prompts,
-            decoding_args=decode.HFDecodingArguments(max_new_tokens=self.args.response_len, temperature=temperature, do_sample=False),
+            decoding_args=decode.HFDecodingArguments(max_new_tokens=self.args.response_len, temperature=1.0, top_p=1.0, do_sample=False),
             per_device_batch_size=self.args.per_device_eval_batch_size,
             divide_work=False,
             # mixed_precision='bf16', # to suppress the mixed_precision fallback to fp32 warning # BUGGY, do not use

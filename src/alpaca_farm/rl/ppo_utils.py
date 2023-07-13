@@ -45,6 +45,7 @@ class TrainingArguments(transformers.TrainingArguments):
     report_value: bool = field(default=False)
     use_value_in_decoding: bool = field(default=False)
     use_mcts: bool = field(default=False)
+    init_v_with_parent: bool = field(default=False)
     wandb_project: str = field(default=constants.WANDB_PROJECT)
     cache_dir: Optional[str] = field(default=constants.DEFAULT_CACHE_DIR)
     flash_attn: bool = field(default=False)
