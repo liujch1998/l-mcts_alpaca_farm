@@ -41,6 +41,7 @@ class DataArguments:
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     debug: bool = field(default=False)
+    visualize: bool = field(default=False)
     mode: str = field(default='train')
     report_value: bool = field(default=False)
     use_value_in_decoding: bool = field(default=False)

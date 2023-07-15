@@ -58,12 +58,16 @@ def pad_sequences_to_left_states(sequences, padding_value=0, max_len=0):
 
 
 class BatchedMCTS():
-    def __init__(self, tokenizer, value_model, policy, ref_policy, reward, batch_size, response_len=300, num_simulations=20, num_sparse_actions=2, pb_c_init=8.0, temperature=1.0, rollout_size=0, visualize=False, init_v_with_parent=False):
+    def __init__(
+        self,
+        tokenizer, policy, value_model,
+        batch_size, response_len=300, num_simulations=10, num_sparse_actions=2, pb_c_init=8.0, temperature=1.0,
+        init_v_with_parent=False,
+        debug=False, visualize=False,
+    ):
         self._tokenizer = tokenizer
-        self._value_model = value_model
         self._policy = policy
-        self._ref_policy = ref_policy
-        self._reward = reward
+        self._value_model = value_model
 
         # Initialize parameters
         self._batch_size = batch_size
@@ -73,10 +77,11 @@ class BatchedMCTS():
         self._num_sparse_actions = min(num_sparse_actions, self._num_actions)
         self._pb_c_init = pb_c_init
         self._temperature = temperature
-        self.rollout_size = rollout_size
 
-        self._visualize = visualize
         self._init_v_with_parent = init_v_with_parent
+
+        self._debug = debug
+        self._visualize = False
 
         # Allocate all necessary storage.
         # For a given search associated to a batch-index, node i is the i-th node
@@ -112,126 +117,6 @@ class BatchedMCTS():
         self._batch_range = np.arange(batch_size)
         self._sim = 0
         self._token_ix = 0
-        self._reset_tree()
-
-        self.records = defaultdict(list)
-
-    # Gets sequence scores from the discriminator
-    def get_values(self, tokens_ids, states=None):
-        """Gets sequence scores from the discriminator"""
-        with torch.no_grad():
-            outputs = self._value_model.forward2_fast(tokens_ids, states=states) # (B)
-        return outputs['values'], outputs['next_states']
-        #     values = values * (tokens_ids[:, -1] != self._tokenizer.eos_token_id) # (B)
-        #     logprobs = self._policy.forward2(tokens_ids) # (B, L)
-        #     ref_logprobs = self._ref_policy.forward2(tokens_ids) # (B, L)
-        #     kl = torch.clamp(logprobs - ref_logprobs, min=0.0)
-        #     non_score_rewards = -0.0067 * kl # -self.kl_ctl.value * kl # TODO: remove the KL hard coding
-        #     non_score_rewards = non_score_rewards[:, -1] # (B) # this is already the KL at the second last position, using the last token as label
-        #     mask = (tokens_ids != self._tokenizer.pad_token_id)
-        #     rewards = self._reward(tokens_ids, attention_mask=mask).rewards # (B)
-        #     rewards = rewards.to(non_score_rewards.dtype) # TODO: Remove this temporary workaround, rewards should be in bf16 in theory but it is giving fp32
-        #     rewards = rewards * (tokens_ids[:, -1] == self._tokenizer.eos_token_id) # (B)
-        #     shaped_rewards = non_score_rewards + rewards
-        #     qs = shaped_rewards + 1.0 * values # TODO: remove the gamma hard coding
-        # return qs
-
-    def _root_fun(self, original_input, temperature):
-        """Initialize roots scores"""
-        # Forward pass of GPT-2 to get priors and states
-        states_by_model = {}
-        model_inputs = self._policy.base_model.prepare_inputs_for_generation(original_input.input_ids, attention_mask=original_input.attention_mask, use_cache=True)
-        # print(f'Policy -- input_ids: {model_inputs["input_ids"].size()}, attention_mask: {model_inputs["attention_mask"].size()}')
-        with torch.no_grad():
-            outputs = self._policy.base_model(
-                **model_inputs,
-                return_dict=True,
-                output_attentions=False,
-                output_hidden_states=False,
-            )
-            states_by_model['policy'] = outputs.past_key_values
-
-            # prompt_masked_input_ids = torch.clone(model_inputs["input_ids"])
-            # inverted_attention_mask = model_inputs["attention_mask"] == 0
-            # prompt_masked_input_ids[inverted_attention_mask]=14827
-            # priors = repetition_penalty(prompt_masked_input_ids, outputs.logits[:, -1, :] / temperature)
-            priors = outputs.logits[:, -1, :] / temperature
-            priors = F.softmax(priors, dim=-1).float().cpu().numpy()
-            
-        # Use of our discriminator to get values
-        values, states = self.get_values(original_input.input_ids)
-        values = values.float().cpu().numpy()
-        states_by_model['value'] = states
-    
-
-        return priors, values, states_by_model
-
-
-    def _rec_fun(self, states_by_model, token_ids, attention_masks, temperature, rollout_size):
-        """Get score from current nodes"""
-        '''
-        Inputs:
-        - token_ids: (B, L), including the new node's token
-        - attention_masks: (B, L)
-        - repetition_penalty: LogitsProcessor
-        Returns:
-        - priors: (B, V), the policy priors for the new node, corresponds to the P(s, a) in the AlphaGo paper
-        - values: (B), this is the value of the new node
-        - next_states
-        '''
-        next_states_by_model = {}
-        # Forward pass of GPT-2 to get priors and states
-        model_inputs = self._policy.base_model.prepare_inputs_for_generation(token_ids, attention_mask=attention_masks, use_cache=True, past_key_values=states_by_model['policy'])
-        # print(f'Policy -- input_ids: {model_inputs["input_ids"].size()}, attention_mask: {model_inputs["attention_mask"].size()}, past_key_values: {model_inputs["past_key_values"][0][0].size()}')
-        with torch.no_grad():
-            outputs = self._policy.base_model(
-                **model_inputs,
-                return_dict=True,
-                output_attentions=False,
-                output_hidden_states=False,
-            )
-
-            next_states_by_model['policy'] = outputs.past_key_values
-            
-            # prompt_masked_input_ids = torch.clone(token_ids)
-            # inverted_attention_mask = attention_masks == 0
-            #penalizing an unused token
-            # prompt_masked_input_ids[inverted_attention_mask]=14827
-            
-            # priors = repetition_penalty(prompt_masked_input_ids, outputs.logits[:, -1, :] / temperature)
-            priors = outputs.logits[:, -1, :] / temperature
-            priors = F.softmax(priors, dim=-1)
-            # LJC: The following rollout seems buggy, DO NOT USE before you fix it
-            # if(rollout_size > 0):
-            #     # next_tokens = torch.multinomial(priors, num_samples=1)
-            #     next_tokens = torch.unsqueeze(torch.argmax(priors, dim=-1), dim=1) # LJC: Why is the next token greedily decoded???
-            #     token_ids = torch.cat((token_ids, next_tokens), dim = 1)
-            #     attention_masks = torch.cat((attention_masks, torch.unsqueeze(torch.ones(len(attention_masks), dtype=torch.long, device=args.device), 1)), dim = 1)
-            #     prompt_masked_input_ids = torch.cat((prompt_masked_input_ids, next_tokens), dim=1)
-            #     model_inputs = self._policy.prepare_inputs_for_generation(token_ids, attention_mask=attention_masks, use_cache=True, past = outputs.past_key_values)
-            #     for i in range(rollout_size):
-            #         with torch.no_grad():
-            #             outputs = self._policy(
-            #                 **model_inputs,
-            #                 return_dict=True,
-            #                 output_attentions=False,
-            #                 output_hidden_states=False,
-            #             )
-            #         # next_tokens = torch.unsqueeze(torch.argmax(F.softmax(repetition_penalty(prompt_masked_input_ids, outputs.logits[:, -1, :] / temperature), dim=-1), dim=-1), dim=1)
-            #         next_tokens = torch.multinomial(priors, num_samples=1) # LJC: Afterwards, the tokens are sampled as desired ... But priors have never been updated!!
-            #         token_ids = torch.cat((token_ids, next_tokens), dim = 1)
-            #         attention_masks = torch.cat((attention_masks, torch.unsqueeze(torch.ones(len(attention_masks), dtype=torch.long, device=args.device), 1)), dim = 1)
-                    
-            #         prompt_masked_input_ids = torch.cat((prompt_masked_input_ids, next_tokens), dim=1)
-            #         model_inputs = gpt.prepare_inputs_for_generation(token_ids, attention_mask = attention_masks, use_cache=True, past = outputs.past_key_values)
-                
-
-        # Use of our discriminator to get values
-        values, next_states = self.get_values(token_ids, states_by_model['value'])
-        values = values.float().cpu().numpy()
-        next_states_by_model['value'] = next_states
-
-        return priors.float().cpu().numpy(), values, next_states_by_model
 
     def _reset_tree(self):
         """Resets the tree arrays."""
@@ -250,20 +135,18 @@ class BatchedMCTS():
         self._token_ids = {} # Indexed by tuples (batch index, node index)
         self._attention_mask = {}
         self._sim = 0
-    
-    def print_tree(self):
-        logger.warning(f'Current tree:')
-        for i in range(self._sim + 1): # sim + 1 is the current number of nodes
-            logger.warning(f'\tnode {i}: n={self._visit_counts[0, i]}, v={self._values[0, i]:.2f}, parent={self._parents[0, i]}, action_from_parent={self._action_from_parents[0, i]}, depth={self._depth[0, i]}, is_terminal={self._is_terminal[0, i]}')
-            for a in range(self._num_sparse_actions):
-                logger.warning(f'\t\taction {a}: token_id={self._topk_mapping[0, i, a]}, child_index={self._children_index[0, i, a]}, child_p={self._children_prior[0, i, a]:.2f}, child_v={self._children_values[0, i, a]:.2f}, child_n={self._children_visits[0, i, a]}')
 
     def generate(self, source):
+        '''
+        source: dict with input_ids and attention_mask
+        Returns an expanded version of source
+        '''
         original_len = len(source.input_ids[0])
         unfinished_sequences = torch.ones_like(source.input_ids[:, -1])
         for self._token_ix in range(self._response_len):
             logger.warning('----------------')
             logger.warning(f'Decoding token {self._token_ix}')
+
             res_search = self.search(source)
             new_token_ids = torch.tensor(np.argmax(res_search, axis=1), dtype=torch.long, device=source.input_ids.device)
             new_token_ids = new_token_ids * unfinished_sequences + self._tokenizer.pad_token_id * (1 - unfinished_sequences)
@@ -278,10 +161,14 @@ class BatchedMCTS():
         return source
 
     def search(self, original_input):
+        '''
+        original_input: dict with input_ids and attention_mask
+        Returns an array of size (B, V)
+        '''
         self._reset_tree()
 
         # Evaluate the root.
-        prior, values, states_by_model = self._root_fun(original_input, self._temperature)
+        prior, values, states_by_model = self._root_fun(original_input)
 
         root_index = 0
         self.create_node(root_index, prior, values, states_by_model, original_input.input_ids, original_input.attention_mask, np.full(self._batch_size, False, dtype=bool))
@@ -308,7 +195,277 @@ class BatchedMCTS():
         return self.dense_visit_counts()
         # return self.dense_scores()
         # return self.dense_mean_scores()
-    
+
+    # Gets sequence scores from the discriminator
+    def get_values(self, tokens_ids, states=None):
+        """Gets sequence scores from the discriminator"""
+        with torch.no_grad():
+            outputs = self._value_model.forward2_fast(tokens_ids, states=states) # (B)
+        return outputs['values'], outputs['next_states']
+
+    def _root_fun(self, original_input):
+        """Initialize roots scores"""
+        states_by_model = {}
+        # Forward pass of GPT-2 to get priors and states
+        model_inputs = self._policy.base_model.prepare_inputs_for_generation(original_input.input_ids, attention_mask=original_input.attention_mask, use_cache=True)
+        with torch.no_grad():
+            outputs = self._policy.base_model(
+                **model_inputs,
+                return_dict=True,
+                output_attentions=False,
+                output_hidden_states=False,
+            )
+            states_by_model['policy'] = outputs.past_key_values
+
+            priors = outputs.logits[:, -1, :] / self._temperature
+            priors = F.softmax(priors, dim=-1).float().cpu().numpy()
+
+        # Use of our discriminator to get values
+        values, states = self.get_values(original_input.input_ids)
+        values = values.float().cpu().numpy()
+        states_by_model['value'] = states
+
+        return priors, values, states_by_model
+
+    def _rec_fun(self, states_by_model, token_ids, attention_masks):
+        """Get score from current nodes"""
+        '''
+        Inputs:
+        - token_ids: (B, L), including the new node's token
+        - attention_masks: (B, L)
+        - repetition_penalty: LogitsProcessor
+        Returns:
+        - priors: (B, V), the policy priors for the new node, corresponds to the P(s, a) in the AlphaGo paper
+        - values: (B), this is the value of the new node
+        - next_states
+        '''
+        next_states_by_model = {}
+        # Forward pass of GPT-2 to get priors and states
+        model_inputs = self._policy.base_model.prepare_inputs_for_generation(token_ids, attention_mask=attention_masks, use_cache=True, past_key_values=states_by_model['policy'])
+        with torch.no_grad():
+            outputs = self._policy.base_model(
+                **model_inputs,
+                return_dict=True,
+                output_attentions=False,
+                output_hidden_states=False,
+            )
+
+            next_states_by_model['policy'] = outputs.past_key_values
+
+            priors = outputs.logits[:, -1, :] / self._temperature
+            priors = F.softmax(priors, dim=-1)
+
+        # Use of our discriminator to get values
+        values, next_states = self.get_values(token_ids, states_by_model['value'])
+        values = values.float().cpu().numpy()
+        next_states_by_model['value'] = next_states
+
+        return priors.float().cpu().numpy(), values, next_states_by_model
+
+    def select(self):
+        """Goes down until all elements have reached unexplored actions."""
+        logger.warning('Selecting ...')
+        node_indices = np.zeros((self._batch_size), np.int32)
+        depth = 0
+        highlight_nodes = [] # [i]
+        highlight_edges = [] # [(i, a)]
+        while True:
+            logger.warning(f'\tdepth={depth}, node_index={node_indices[0]}')
+            depth += 1
+            actions = self.uct_select_action(node_indices)
+            logger.warning(f'\tselected_action={actions[0]}')
+            next_node_indices = self._children_index[self._batch_range, node_indices, actions]
+            highlight_nodes.append(node_indices[0])
+            highlight_edges.append((node_indices[0], actions[0]))
+            is_unexplored = next_node_indices == -1
+            if is_unexplored.all():
+                logger.warning(f'\tSelected node {node_indices[0]}, action {actions[0]}')
+                self.visualize_tree(stage='1-select', highlight_nodes=highlight_nodes, highlight_edges=highlight_edges, highlight_color='blue')
+                return node_indices, actions
+            else:
+                node_indices = np.where(is_unexplored, node_indices, next_node_indices)
+
+    def uct_select_action(self, node_indices):
+        """Returns the action selected for a batch of node indices of shape (B)."""
+        node_children_prior = self._children_prior[self._batch_range, node_indices, :] # (B, A)
+        node_children_values = self._children_values[self._batch_range, node_indices, :] # (B, A)
+        node_children_visits = self._children_visits[self._batch_range, node_indices, :] # (B, A)
+        node_visits = self._visit_counts[self._batch_range, node_indices] # (B)
+        node_policy_score = np.sqrt(node_visits[:, None]) * self._pb_c_init * node_children_prior / (node_children_visits + 1) # (B, A)
+
+        node_value_score = node_children_values
+
+        node_uct_score = node_value_score + node_policy_score # (B, A)
+        for a in range(self._num_sparse_actions):
+            logger.warning(f'\t\taction {a}: policy_score={node_policy_score[0, a]:.2f}, value_score={node_value_score[0, a]:.2f}, uct_score={node_uct_score[0, a]:.2f}')
+        actions = np.argmax(node_uct_score, axis=1)
+        return actions
+
+    def expand(self, node_indices, actions, next_node_index):
+        """Creates and evaluate child nodes from given nodes and unexplored actions."""
+        logger.warning('Expanding ...')
+
+        # Retrieve token ids for nodes to be evaluated.
+        tokens_ids = pad_sequences_to_left([self._token_ids[(b, n)] for b, n in enumerate(node_indices)], True, self._tokenizer.eos_token_id)
+        attention_masks = pad_sequences_to_left([self._attention_mask[(b, n)] for b, n in enumerate(node_indices)], True, 0)
+        depths = torch.tensor([self._depth[(b, n)]+1 for b, n in enumerate(node_indices)], device=tokens_ids.device)
+
+        policy_states_tensor = pad_sequences_to_left_states([self.get_states_from_node(b, n, depths[b].item(), 'policy') for b, n in enumerate(node_indices)], 0, max_len=len(tokens_ids[0]))
+        policy_states = tuple(tuple(type_of_value for type_of_value in layer) for layer in policy_states_tensor)
+        value_states_tensor = pad_sequences_to_left_states([self.get_states_from_node(b, n, depths[b].item(), 'value') for b, n in enumerate(node_indices)], 0, max_len=len(tokens_ids[0]))
+        value_states = tuple(tuple(type_of_value for type_of_value in layer) for layer in value_states_tensor)
+        states_by_model = {'policy': policy_states, 'value': value_states}
+
+        # Convert sparse actions to dense actions for network computation
+        dense_actions = self._topk_mapping[self._batch_range, node_indices, actions]
+        # Add actions to list of tokens and extend attention mask by 1
+        tokens_ids = torch.cat((tokens_ids, torch.unsqueeze(torch.cuda.LongTensor(dense_actions), 1)), dim = 1)
+        attention_masks = torch.cat((attention_masks, torch.unsqueeze(torch.ones(len(dense_actions), dtype=torch.long, device=attention_masks.device), 1)), dim = 1)
+
+        # Check if expanded nodes are terminal
+        expanded_node_is_terminal = dense_actions == self._tokenizer.eos_token_id
+
+        # Evaluate nodes.
+        (prior, values, next_states_by_model) = self._rec_fun(states_by_model, tokens_ids, attention_masks)
+
+        # Create the new nodes.
+        self.create_node(next_node_index, prior, values, next_states_by_model, tokens_ids, attention_masks, expanded_node_is_terminal)
+
+        # Update tree topology.
+        self._children_index[self._batch_range, node_indices, actions] = next_node_index
+        self._parents[:, next_node_index] = node_indices
+        self._action_from_parents[:, next_node_index] = actions
+        self._depth[:, next_node_index] = self._depth[self._batch_range, node_indices] + 1
+
+        logger.warning(f'\tCreated node {next_node_index}: n={self._visit_counts[0, next_node_index]}, v={self._values[0, next_node_index]:.2f}, parent={self._parents[0, next_node_index]}, action_from_parent={self._action_from_parents[0, next_node_index]}, depth={self._depth[0, next_node_index]}, is_terminal={self._is_terminal[0, next_node_index]}')
+        for a in range(self._num_sparse_actions):
+            logger.warning(f'\t\taction {a}: token_id={self._topk_mapping[0, next_node_index, a]}, child_index={self._children_index[0, next_node_index, a]}, child_p={self._children_prior[0, next_node_index, a]:.2f}, child_v={self._children_values[0, next_node_index, a]:.2f}, child_n={self._children_visits[0, next_node_index, a]}')
+        self.visualize_tree(
+            stage='2-expand',
+            highlight_nodes=[next_node_index],
+            highlight_edges=[(next_node_index, a) for a in range(self._num_sparse_actions)],
+            highlight_color='red',
+        )
+
+    def get_states_from_node(self, b, n, d, model):
+        """Forge state tensor by going backward from the node to the root (because we only store on token's part on each node to avoid duplication)"""
+        '''
+        model: 'policy' or 'value'
+        '''
+        state_array = [None] * d
+        state_array[d-1] = self._states_by_model[model][(b, n)]
+        while n!=0:
+            n = self._parents[(b, n)]
+            d -= 1
+            state_array[d-1] = self._states_by_model[model][(b, n)]
+
+        result = torch.cat(state_array, 3)
+        return result
+
+    def create_node(self, node_index, prior, values, next_states_by_model, tokens_ids, attention_masks, expanded_node_is_terminal):
+        """Create nodes with computed values"""
+        # Truncate the prior to only keep the top k logits
+        prior_topk_indices = np.argpartition(prior, -self._num_sparse_actions, axis=-1)[:, -self._num_sparse_actions:]
+        prior = prior[self._batch_range[:, None], prior_topk_indices] # (B, A)
+
+        # Store the indices of the top k logits
+        self._topk_mapping[self._batch_range, node_index, :] = prior_topk_indices
+
+        # Update prior, values and visit counts.
+        self._children_prior[:, node_index, :] = prior
+
+        self._values[:, node_index] = values
+        self._visit_counts[:, node_index] = 1
+        self._is_terminal[:, node_index] = expanded_node_is_terminal
+
+        # Optionally initialize the children values with the parent value
+        if self._init_v_with_parent:
+            self._children_values[:, node_index, :] = values[:, np.newaxis]
+
+        # Transform the returned states format into tensor for easier manipulation
+        for model in ['policy', 'value']:
+            key_value_tensor = torch.stack(list(torch.stack(list(next_states_by_model[model][i]), dim=0) for i in range(len(next_states_by_model[model]))), dim=0) # (Y, 2, B, H, L, D/H)
+            if(node_index == 0):
+                for b in range(len(tokens_ids)):
+                    self._states_by_model[model][(b, node_index)] = torch.clone(key_value_tensor[:, :, b])
+            else:
+                for b in range(len(tokens_ids)):
+                    self._states_by_model[model][(b, node_index)] = torch.clone(key_value_tensor[:, :, b, :, -1:]) # only store the last token's state
+
+        # Updates tokens ids
+        for b, token_ids in enumerate(tokens_ids):
+            self._token_ids[(b, node_index)] = token_ids
+
+        # Updates attention masks
+        for b, attention_mask in enumerate(attention_masks):
+            self._attention_mask[(b, node_index)] = attention_mask
+
+    def backward(self, leaf_indices):
+        """Goes up and updates the tree until all nodes reached the root."""
+        logger.warning(f'Backward ...')
+        node_indices = leaf_indices # (B)
+        leaf_values = self._values[self._batch_range, leaf_indices]
+        highlight_nodes = []
+        highlight_edges = []
+        while True:
+            is_root = node_indices == 0
+            if is_root.all():
+                self.visualize_tree(stage='3-backward', highlight_nodes=highlight_nodes, highlight_edges=highlight_edges, highlight_color='orange')
+                return
+            parents = np.where(is_root, 0, self._parents[self._batch_range, node_indices])
+            if parents[0] != -1:
+                highlight_nodes.append(parents[0])
+                a = self._action_from_parents[0, node_indices[0]]
+                highlight_edges.append((parents[0], a))
+            root_mask = 1.0 * is_root
+            not_root_mask_int = (1 - is_root)
+            not_root_mask = 1.0 - root_mask
+            # Update the parent nodes iff their child is not the root.
+            # We therefore mask the updates using not_root_mask and root_mask.
+            self._values[self._batch_range, parents] = not_root_mask * (self._values[self._batch_range, parents] *
+                self._visit_counts[self._batch_range, parents] + leaf_values) / (self._visit_counts[self._batch_range,
+                parents] + 1.0) + root_mask * self._values[self._batch_range, parents]
+
+            # self._values[self._batch_range, parents] = not_root_mask * (np.maximum(self._values[self._batch_range, parents],leaf_values)) + root_mask * self._values[self._batch_range, parents]
+
+            self._visit_counts[self._batch_range, parents] += not_root_mask_int
+            actions = np.where(is_root, 0, self._action_from_parents[self._batch_range, node_indices])
+            self._children_values[self._batch_range, parents, actions] = not_root_mask * self._values[self._batch_range,node_indices] + root_mask * self._children_values[self._batch_range, parents, actions]
+            self._children_visits[self._batch_range, parents, actions] += not_root_mask_int
+            # Go up
+            node_indices = parents
+
+    def dense_visit_counts(self):
+        root_index = 0
+        root_visit_counts = self._children_visits[:, root_index, :]
+        dense_visit_counts = np.zeros((self._batch_size, self._num_actions))
+        dense_visit_counts[self._batch_range[:, None], self._topk_mapping[:, root_index, :]] = root_visit_counts
+        return dense_visit_counts
+
+    def dense_scores(self):
+        root_index = 0
+        root_scores = self._children_values[:, root_index, :]
+        dense_root_scores = np.zeros((self._batch_size, self._num_actions))
+        dense_root_scores[self._batch_range[:, None], self._topk_mapping[:, root_index, :]] = root_scores
+        root_visit_counts = self._children_visits[:, root_index, :]
+        return dense_root_scores
+
+    def dense_mean_scores(self):
+        root_index = 0
+        root_visit_counts = self._children_visits[:, root_index, :]
+        root_scores = self._children_values[:, root_index, :]
+        root_mean_scores = root_scores / root_visit_counts
+        dense_mean_scores = np.zeros((self._batch_size, self._num_actions))
+        dense_mean_scores[self._batch_range[:, None], self._topk_mapping[:, root_index, :]] = root_mean_scores
+        return dense_mean_scores
+
+    def print_tree(self):
+        logger.warning(f'Current tree:')
+        for i in range(self._sim + 1): # sim + 1 is the current number of nodes
+            logger.warning(f'\tnode {i}: n={self._visit_counts[0, i]}, v={self._values[0, i]:.2f}, parent={self._parents[0, i]}, action_from_parent={self._action_from_parents[0, i]}, depth={self._depth[0, i]}, is_terminal={self._is_terminal[0, i]}')
+            for a in range(self._num_sparse_actions):
+                logger.warning(f'\t\taction {a}: token_id={self._topk_mapping[0, i, a]}, child_index={self._children_index[0, i, a]}, child_p={self._children_prior[0, i, a]:.2f}, child_v={self._children_values[0, i, a]:.2f}, child_n={self._children_visits[0, i, a]}')
+
     def visualize_tree(self, stage, highlight_nodes=[], highlight_edges=[], highlight_color='blue'):
         '''
         stage: '0-pre', '1-select', '2-expand', '3-backup', '4-post'
@@ -351,7 +508,7 @@ class BatchedMCTS():
             a = edge.get_attributes()['a']
             if (int(head_node), int(a)) in highlight_edges:
                 edge.set_color(highlight_color)
-        
+
         # Add a title to the image
         token_ids = self._token_ids[(0, 0)]
         prompt = self._tokenizer.decode(token_ids, clean_up_tokenization_spaces=False)
@@ -363,205 +520,3 @@ class BatchedMCTS():
         dot_graph.add_node(node)
 
         dot_graph.write_png(f'trees/token-{self._token_ix:03d}_sim-{self._sim:03d}_stage-{stage}.png')
-
-    def dense_visit_counts(self):
-        root_index = 0
-        root_visit_counts = self._children_visits[:, root_index, :]
-        dense_visit_counts = np.zeros((self._batch_size, self._num_actions))
-        dense_visit_counts[self._batch_range[:, None], self._topk_mapping[:, root_index, :]] = root_visit_counts
-        return dense_visit_counts
-    
-    def dense_scores(self):
-        root_index = 0
-        root_scores = self._children_values[:, root_index, :]
-        dense_root_scores = np.zeros((self._batch_size, self._num_actions))
-        dense_root_scores[self._batch_range[:, None], self._topk_mapping[:, root_index, :]] = root_scores
-        root_visit_counts = self._children_visits[:, root_index, :]
-        return dense_root_scores
-
-    def dense_mean_scores(self):
-        root_index = 0
-        root_visit_counts = self._children_visits[:, root_index, :]
-        root_scores = self._children_values[:, root_index, :]
-        root_mean_scores = root_scores / root_visit_counts
-        dense_mean_scores = np.zeros((self._batch_size, self._num_actions))
-        dense_mean_scores[self._batch_range[:, None], self._topk_mapping[:, root_index, :]] = root_mean_scores
-        return dense_mean_scores
-
-    def select(self):
-        """Goes down until all elements have reached unexplored actions."""
-        logger.warning('Selecting ...')
-        node_indices = np.zeros((self._batch_size), np.int32)
-        depth = 0
-        highlight_nodes = [] # [i]
-        highlight_edges = [] # [(i, a)]
-        while True:
-            logger.warning(f'\tdepth={depth}, node_index={node_indices[0]}')
-            depth += 1
-            actions = self.uct_select_action(node_indices)
-            logger.warning(f'\tselected_action={actions[0]}')
-            next_node_indices = self._children_index[self._batch_range, node_indices, actions]
-            highlight_nodes.append(node_indices[0])
-            highlight_edges.append((node_indices[0], actions[0]))
-            is_unexplored = next_node_indices == -1
-            if is_unexplored.all():
-                logger.warning(f'\tSelected node {node_indices[0]}, action {actions[0]}')
-                self.visualize_tree(stage='1-select', highlight_nodes=highlight_nodes, highlight_edges=highlight_edges, highlight_color='blue')
-                return node_indices, actions
-            else:
-                node_indices = np.where(is_unexplored, node_indices, next_node_indices)
-    
-    def uct_select_action(self, node_indices):
-        """Returns the action selected for a batch of node indices of shape (B)."""
-        node_children_prior = self._children_prior[self._batch_range, node_indices, :] # (B, A)
-        node_children_values = self._children_values[self._batch_range, node_indices, :] # (B, A)
-        node_children_visits = self._children_visits[self._batch_range, node_indices, :] # (B, A)
-        node_visits = self._visit_counts[self._batch_range, node_indices] # (B)
-        node_policy_score = np.sqrt(node_visits[:, None]) * self._pb_c_init * node_children_prior / (node_children_visits + 1) # (B, A)
-        
-        node_value_score = node_children_values 
-        
-        node_uct_score = node_value_score + node_policy_score # (B, A)
-        for a in range(self._num_sparse_actions):
-            logger.warning(f'\t\taction {a}: policy_score={node_policy_score[0, a]:.2f}, value_score={node_value_score[0, a]:.2f}, uct_score={node_uct_score[0, a]:.2f}')
-        actions = np.argmax(node_uct_score, axis=1)
-        return actions
-
-    def get_states_from_node(self, b, n, d, model): 
-        """Forge state tensor by going backward from the node to the root (because we only store on token's part on each node to avoid duplication)"""
-        '''
-        model: 'policy' or 'value'
-        '''
-        state_array = [None] * d
-        state_array[d-1] = self._states_by_model[model][(b, n)]
-        while n!=0:
-            n = self._parents[(b, n)]
-            d -= 1
-            state_array[d-1] = self._states_by_model[model][(b, n)]
-
-        result = torch.cat(state_array, 3)
-        return result
-
-    def expand(self, node_indices, actions, next_node_index):
-        """Creates and evaluate child nodes from given nodes and unexplored actions."""
-        logger.warning('Expanding ...')
-
-        # Retrieve token ids for nodes to be evaluated.
-        tokens_ids = pad_sequences_to_left([self._token_ids[(b, n)] for b, n in enumerate(node_indices)], True, self._tokenizer.eos_token_id)
-        attention_masks = pad_sequences_to_left([self._attention_mask[(b, n)] for b, n in enumerate(node_indices)], True, 0)
-        depths = torch.tensor([self._depth[(b, n)]+1 for b, n in enumerate(node_indices)], device=tokens_ids.device)
-        
-        policy_states_tensor = pad_sequences_to_left_states([self.get_states_from_node(b, n, depths[b].item(), 'policy') for b, n in enumerate(node_indices)], 0, max_len=len(tokens_ids[0]))
-        policy_states = tuple(tuple(type_of_value for type_of_value in layer) for layer in policy_states_tensor)
-        value_states_tensor = pad_sequences_to_left_states([self.get_states_from_node(b, n, depths[b].item(), 'value') for b, n in enumerate(node_indices)], 0, max_len=len(tokens_ids[0]))
-        value_states = tuple(tuple(type_of_value for type_of_value in layer) for layer in value_states_tensor)
-        states_by_model = {'policy': policy_states, 'value': value_states}
-        
-        # Convert sparse actions to dense actions for network computation
-        dense_actions = self._topk_mapping[self._batch_range, node_indices, actions]
-        # Add actions to list of tokens and extend attention mask by 1
-        tokens_ids = torch.cat((tokens_ids, torch.unsqueeze(torch.cuda.LongTensor(dense_actions), 1)), dim = 1)
-        attention_masks = torch.cat((attention_masks, torch.unsqueeze(torch.ones(len(dense_actions), dtype=torch.long, device=attention_masks.device), 1)), dim = 1)
-
-        # Check if expanded nodes are terminal 
-        expanded_node_is_terminal = dense_actions == self._tokenizer.eos_token_id 
-
-        # Evaluate nodes.
-        (prior, values, next_states_by_model) = self._rec_fun(states_by_model, tokens_ids, attention_masks, self._temperature, self.rollout_size)
-       
-        # Create the new nodes.
-        self.create_node(next_node_index, prior, values, next_states_by_model, tokens_ids, attention_masks, expanded_node_is_terminal)
-        
-        # Update tree topology.
-        self._children_index[self._batch_range, node_indices, actions] = next_node_index
-        self._parents[:, next_node_index] = node_indices
-        self._action_from_parents[:, next_node_index] = actions
-        self._depth[:, next_node_index] = self._depth[self._batch_range, node_indices] + 1
-
-        logger.warning(f'\tCreated node {next_node_index}: n={self._visit_counts[0, next_node_index]}, v={self._values[0, next_node_index]:.2f}, parent={self._parents[0, next_node_index]}, action_from_parent={self._action_from_parents[0, next_node_index]}, depth={self._depth[0, next_node_index]}, is_terminal={self._is_terminal[0, next_node_index]}')
-        for a in range(self._num_sparse_actions):
-            logger.warning(f'\t\taction {a}: token_id={self._topk_mapping[0, next_node_index, a]}, child_index={self._children_index[0, next_node_index, a]}, child_p={self._children_prior[0, next_node_index, a]:.2f}, child_v={self._children_values[0, next_node_index, a]:.2f}, child_n={self._children_visits[0, next_node_index, a]}')
-        self.visualize_tree(
-            stage='2-expand',
-            highlight_nodes=[next_node_index],
-            highlight_edges=[(next_node_index, a) for a in range(self._num_sparse_actions)],
-            highlight_color='red',
-        )
-
-    def create_node(self, node_index, prior, values, next_states_by_model, tokens_ids, attention_masks, expanded_node_is_terminal):
-        """Create nodes with computed values"""
-        # Truncate the prior to only keep the top k logits
-        prior_topk_indices = np.argpartition(prior, -self._num_sparse_actions, axis=-1)[:, -self._num_sparse_actions:]
-        prior = prior[self._batch_range[:, None], prior_topk_indices] # (B, A)
-        
-        # Store the indices of the top k logits
-        self._topk_mapping[self._batch_range, node_index, :] = prior_topk_indices
-        
-        # Update prior, values and visit counts.
-        self._children_prior[:, node_index, :] = prior
-
-        # raw_values = values**(self.alpha) * likelihoods**(1-self.alpha)
-        # raw_values = values # LJC: removed the likelihood thing
-        self._values[:, node_index] = values
-        # self._raw_values[:, node_index] = raw_values
-        self._visit_counts[:, node_index] = 1
-        self._is_terminal[:, node_index] = expanded_node_is_terminal
-
-        # Optionally initialize the children values with the parent value
-        if self._init_v_with_parent:
-            self._children_values[:, node_index, :] = values[:, np.newaxis]
-
-        # Transform the returned states format into tensor for easier manipulation
-        for model in ['policy', 'value']:
-            key_value_tensor = torch.stack(list(torch.stack(list(next_states_by_model[model][i]), dim=0) for i in range(len(next_states_by_model[model]))), dim=0) # (Y, 2, B, H, L, D/H)
-            if(node_index == 0):
-                for b in range(len(tokens_ids)):
-                    self._states_by_model[model][(b, node_index)] = torch.clone(key_value_tensor[:, :, b])
-            else:
-                for b in range(len(tokens_ids)):
-                    self._states_by_model[model][(b, node_index)] = torch.clone(key_value_tensor[:, :, b, :, -1:]) # only store the last token's state
-
-        # Updates tokens ids
-        for b, token_ids in enumerate(tokens_ids):
-            self._token_ids[(b, node_index)] = token_ids
-        
-        # Updates attention masks
-        for b, attention_mask in enumerate(attention_masks):
-            self._attention_mask[(b, node_index)] = attention_mask
-
-
-    def backward(self, leaf_indices):
-        """Goes up and updates the tree until all nodes reached the root."""
-        logger.warning(f'Backward ...')
-        node_indices = leaf_indices # (B)
-        leaf_values = self._values[self._batch_range, leaf_indices]
-        highlight_nodes = []
-        highlight_edges = []
-        while True:
-            is_root = node_indices == 0
-            if is_root.all():
-                self.visualize_tree(stage='3-backward', highlight_nodes=highlight_nodes, highlight_edges=highlight_edges, highlight_color='orange')
-                return
-            parents = np.where(is_root, 0, self._parents[self._batch_range, node_indices])
-            if parents[0] != -1:
-                highlight_nodes.append(parents[0])
-                a = self._action_from_parents[0, node_indices[0]]
-                highlight_edges.append((parents[0], a))
-            root_mask = 1.0 * is_root
-            not_root_mask_int = (1 - is_root)
-            not_root_mask = 1.0 - root_mask
-            # Update the parent nodes iff their child is not the root.
-            # We therefore mask the updates using not_root_mask and root_mask.
-            self._values[self._batch_range, parents] = not_root_mask * (self._values[self._batch_range, parents] *
-                self._visit_counts[self._batch_range, parents] + leaf_values) / (self._visit_counts[self._batch_range,
-                parents] + 1.0) + root_mask * self._values[self._batch_range, parents]
-            
-            # self._values[self._batch_range, parents] = not_root_mask * (np.maximum(self._values[self._batch_range, parents],leaf_values)) + root_mask * self._values[self._batch_range, parents]
-
-            self._visit_counts[self._batch_range, parents] += not_root_mask_int
-            actions = np.where(is_root, 0, self._action_from_parents[self._batch_range, node_indices])
-            self._children_values[self._batch_range, parents, actions] = not_root_mask * self._values[self._batch_range,node_indices] + root_mask * self._children_values[self._batch_range, parents, actions]
-            self._children_visits[self._batch_range, parents, actions] += not_root_mask_int
-            # Go up
-            node_indices = parents
-
