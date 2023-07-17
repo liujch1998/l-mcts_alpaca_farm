@@ -141,6 +141,39 @@ class AutoregressivePolicy(Policy):
         # )
         return logprobs
 
+    @torch.inference_mode()
+    def forward_mcts(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        states = None,
+        temperature: Optional[float] = None,
+    ):
+        '''
+        Inputs:
+        - input_ids
+        - attention_mask
+        - states
+        Outputs:
+        - priors: (B, V)
+        - next_states
+        '''
+        model_inputs = self.base_model.prepare_inputs_for_generation(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=states,
+            use_cache=True,
+        ) # This is needed because we need to get the position_ids right
+        outputs = self.base_model(
+            **model_inputs,
+            return_dict=True,
+            output_attentions=False,
+            output_hidden_states=False,
+        )
+        priors = outputs.logits[:, -1, :] / temperature # (B, V)
+        priors = torch.nn.functional.softmax(priors, dim=-1) # (B, V)
+        return dict(priors=priors, next_states=outputs.past_key_values)
+
     def _respond(
         self,
         queries: Tensor,

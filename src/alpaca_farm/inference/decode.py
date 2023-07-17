@@ -326,7 +326,7 @@ def decode_prompts_with_huggingface_given_model(
                                             init_v_with_parent=args.init_v_with_parent,
                                             debug=args.debug, visualize=args.visualize,
                                             )
-                    source = MCTS.generate(source)
+                    source.input_ids, source.attention_mask = MCTS.generate(source.input_ids, source.attention_mask)
                 except Exception as e:
                     logger.error(traceback.format_exc())
                     # logger.error(e)
