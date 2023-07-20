@@ -1,0 +1,46 @@
+#!/bin/bash
+
+output_dir=$1
+run_name=$2
+reward_model_name_or_path=$3
+policy_model_name_or_path=$4
+kl_coef=${5:-0.0067}
+
+cd ~/l-mcts
+# module load anaconda3
+# source "/public/apps/anaconda3/2022.05/etc/profile.d/conda.sh"
+conda activate l-mcts
+# export LD_LIBRARY_PATH=~/.conda/envs/l-mcts/lib/python3.8/site-packages/nvidia/cublas/lib:~/.conda/envs/l-mcts/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=$NETHOME/anaconda3/envs/l-mcts/lib/python3.9/site-packages/nvidia/cublas/lib:$NETHOME/anaconda3/envs/l-mcts/lib:$LD_LIBRARY_PATH
+
+num_processes=$(($SLURM_GPUS_ON_NODE * $SLURM_JOB_NUM_NODES))
+main_node_name=$(scontrol show hostnames $SLURM_JOB_NODELIST | sort | head -n 1)
+main_ip_address=$(python -c 'import sys; import socket; ip=socket.gethostbyname(sys.argv[1]); print(ip)' ${main_node_name})
+# available_port=$(python -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')
+available_port=29510
+
+NCCL_IB_TIMEOUT=22 accelerate launch \
+    --num_machines $SLURM_JOB_NUM_NODES --machine_rank $SLURM_NODEID --same_network \
+    --num_processes $num_processes \
+    --main_process_ip $main_ip_address --main_process_port $available_port \
+    --mixed_precision bf16 --downcast_bf16 \
+    --use_fsdp --fsdp_auto_wrap_policy TRANSFORMER_BASED_WRAP --fsdp_backward_prefetch_policy BACKWARD_PRE --fsdp_offload_params false --fsdp_sharding_strategy 1 --fsdp_state_dict_type FULL_STATE_DICT --fsdp_transformer_layer_cls_to_wrap LlamaDecoderLayer \
+    alpaca_farm/examples/rlhf_ppo.py \
+    --wandb_project "l-MCTS" \
+    --run_name "${run_name}" \
+    --step_per_device_batch_size 2 \
+    --rollout_per_device_batch_size 32 \
+    --per_device_eval_batch_size 32 \
+    --output_dir "${output_dir}" \
+    --reward_model_name_or_path "${reward_model_name_or_path}" \
+    --policy_model_name_or_path "${policy_model_name_or_path}" \
+    --init_value_with_reward True \
+    --rollout_batch_size 512 \
+    --step_batch_size 256 \
+    --learning_rate 1e-5 \
+    --warmup_steps 5 \
+    --kl_coef "${kl_coef}" \
+    --total_epochs 10 \
+    --flash_attn True \
+    --prompt_dict_path "./alpaca_farm/examples/prompts/v0_inputs_noinputs.json" \
+    --save_steps 20
