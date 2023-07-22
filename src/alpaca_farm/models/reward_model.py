@@ -56,3 +56,30 @@ class RewardModel(transformers.PreTrainedModel):
         # TODO(lxuechen): Make returning rewards at all positions and last_hidden_state an option.
         rewards = self.reward_head(last_hidden_state_at_the_end).squeeze(-1)
         return RewardModelOutput(rewards=rewards) if return_dict else (rewards,)
+
+    @torch.inference_mode()
+    def forward_mcts(self, input_ids, attention_mask, states=None):
+        '''
+        Inputs:
+        - input_ids
+        - attention_mask
+        - states
+        Outputs:
+        - values: (B)
+        - next_states
+        '''
+        model_inputs = self.backbone_model.prepare_inputs_for_generation(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=states,
+            use_cache=True,
+        )
+        outputs = self.backbone_model.model(
+            **model_inputs,
+            return_dict=True,
+            output_attentions=False,
+            output_hidden_states=True,
+        )
+        last_hidden_state = outputs.last_hidden_state[:, -1, :] # (B, V)
+        rewards = self.reward_head(last_hidden_state).squeeze(-1) # (B)
+        return dict(rewards=rewards, next_states=outputs.past_key_values)
