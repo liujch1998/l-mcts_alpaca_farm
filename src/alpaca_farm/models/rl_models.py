@@ -146,6 +146,7 @@ class AutoregressivePolicy(Policy):
         self,
         input_ids: Tensor,
         attention_mask: Tensor,
+        encoder_len = None,
         states = None,
         temperature: Optional[float] = None,
     ):

@@ -58,7 +58,7 @@ class RewardModel(transformers.PreTrainedModel):
         return RewardModelOutput(rewards=rewards) if return_dict else (rewards,)
 
     @torch.inference_mode()
-    def forward_mcts(self, input_ids, attention_mask, states=None):
+    def forward_mcts(self, input_ids, attention_mask, encoder_len=None, states=None):
         '''
         Inputs:
         - input_ids
